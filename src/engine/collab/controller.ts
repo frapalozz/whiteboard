@@ -2,7 +2,8 @@ import type { El, GridMode, Point } from "../types";
 import { CollabDoc, MAX_POINTS, type Props } from "./doc";
 import { cleanName, colorFor, randomId } from "./protocol";
 import { CollabSession, webrtcSupported } from "./session";
-import { decodeInvite, type Invite } from "./signaling";
+import { relaySupported } from "./relay";
+import { buildInviteUrl, decodeInvite, encodeRoomInvite, type AnyInvite } from "./signaling";
 import { OFF_UI, type Batch, type CollabSaved, type CollabUI, type Msg } from "./types";
 
 /** Ciò che il motore deve offrire al livello di collaborazione. */
@@ -49,6 +50,7 @@ export class Collab {
   private session: CollabSession | null = null;
   private name = "";
   private stun = true;
+  private relay = true;
   private pending = new Set<string>();
   private pendingProps = false;
   private synced = false;
@@ -76,9 +78,10 @@ export class Collab {
       if (raw) {
         const d: unknown = JSON.parse(raw);
         if (typeof d === "object" && d !== null) {
-          const o = d as { name?: unknown; stun?: unknown };
+          const o = d as { name?: unknown; stun?: unknown; relay?: unknown };
           if (typeof o.name === "string") this.name = cleanName(o.name, "");
           if (typeof o.stun === "boolean") this.stun = o.stun;
+          if (typeof o.relay === "boolean") this.relay = o.relay;
         }
       }
     } catch {
@@ -95,6 +98,8 @@ export class Collab {
   load(saved: CollabSaved | undefined, elements: El[]): void {
     this.teardown();
     if (saved) this.doc = CollabDoc.restore(saved, elements);
+    // con il relay si rientra nella stanza da soli (ricaricamento, pagina sospesa e riaperta dal telefono…)
+    if (this.doc && this.relay && webrtcSupported() && relaySupported()) this.ensureSession();
     this.refreshUI();
   }
 
@@ -122,7 +127,7 @@ export class Collab {
     if (!webrtcSupported()) return { ok: false, error: "Questo browser non supporta WebRTC" };
     if (this.doc) return { ok: true };
     this.setName(name);
-    const doc = new CollabDoc(randomId(8), randomId(), "host");
+    const doc = new CollabDoc(randomId(16), randomId(), "host");
     this.doc = doc;
     doc.local(this.host.getElements(), this.host.getProps(), undefined, true);
     this.synced = true;
@@ -132,21 +137,35 @@ export class Collab {
     return { ok: true };
   }
 
-  /** Lavagna nuova e vuota che si unirà a una stanza: l'ospite parte senza contenuto né metadati. */
-  async beginGuest(inv: Invite, name: string): Promise<Result<{ answer: string }>> {
+  /**
+   * Lavagna nuova e vuota che si unirà a una stanza: l'ospite parte senza contenuto né metadati.
+   * Con un invito manuale ritorna il codice di risposta da mandare all'host; con il link della stanza
+   * (`answer: null`) il collegamento passa dal relay e parte da solo.
+   */
+  async beginGuest(inv: AnyInvite, name: string): Promise<Result<{ answer: string | null }>> {
     if (!webrtcSupported()) return { ok: false, error: "Questo browser non supporta WebRTC" };
+    if (inv.kind === "room" && !relaySupported()) return { ok: false, error: "Questo browser non supporta il collegamento automatico" };
     this.setName(name);
     this.doc = new CollabDoc(inv.room, randomId(), "guest");
     return this.answer(inv, true);
   }
 
   /** Riconnessione a una stanza di cui questa lavagna fa già parte (stessa identità, stesso storico). */
-  async resume(inv: Invite, name: string): Promise<Result<{ answer: string }>> {
+  async resume(inv: AnyInvite, name: string): Promise<Result<{ answer: string | null }>> {
     this.setName(name);
     return this.answer(inv, false);
   }
 
-  private async answer(inv: Invite, fresh: boolean): Promise<Result<{ answer: string }>> {
+  private async answer(inv: AnyInvite, fresh: boolean): Promise<Result<{ answer: string | null }>> {
+    if (inv.kind === "room") {
+      // il link della stanza funziona solo attraverso il relay: chi lo apre lo vuole usare
+      if (!this.relay) this.setRelay(true);
+      this.ensureSession();
+      this.session?.setRelay(true);
+      this.host.persist();
+      this.refreshUI();
+      return { ok: true, answer: null };
+    }
     this.ensureSession();
     try {
       const answer = await (this.session as CollabSession).answerInvite(inv);
@@ -193,7 +212,19 @@ export class Collab {
     }
   }
 
-  static async parseInvite(text: string): Promise<Invite | null> {
+  /** Link della stanza (riutilizzabile, per il collegamento automatico via relay). */
+  async roomLink(): Promise<Result<{ url: string }>> {
+    const doc = this.doc;
+    if (!doc) return { ok: false, error: "La collaborazione non è attiva" };
+    try {
+      const code = await encodeRoomInvite({ room: doc.room, n: this.effectiveName(), b: this.host.getBoardName() });
+      return { ok: true, url: buildInviteUrl(code) };
+    } catch {
+      return { ok: false, error: "Impossibile creare il link" };
+    }
+  }
+
+  static async parseInvite(text: string): Promise<AnyInvite | null> {
     return decodeInvite(text);
   }
 
@@ -211,9 +242,17 @@ export class Collab {
     this.refreshUI();
   }
 
+  setRelay(relay: boolean): void {
+    this.relay = relay;
+    if (relay && this.doc) this.ensureSession();
+    this.session?.setRelay(relay);
+    this.savePrefs();
+    this.refreshUI();
+  }
+
   private savePrefs(): void {
     try {
-      localStorage.setItem(PREFS_KEY, JSON.stringify({ name: this.name, stun: this.stun }));
+      localStorage.setItem(PREFS_KEY, JSON.stringify({ name: this.name, stun: this.stun, relay: this.relay }));
     } catch {
       /* non critico */
     }
@@ -227,7 +266,7 @@ export class Collab {
     const doc = this.doc;
     if (!doc || this.session) return;
     this.session = new CollabSession(
-      { room: doc.room, site: doc.site, name: this.effectiveName(), stun: this.stun },
+      { room: doc.room, site: doc.site, name: this.effectiveName(), stun: this.stun, relay: this.relay && relaySupported() },
       {
         onPeerOpen: (peer) => {
           this.remotes.set(peer.site, { site: peer.site, name: peer.name, color: peer.color, cursor: null, draft: null });
@@ -402,6 +441,8 @@ export class Collab {
       peers: this.session?.peerList ?? [],
       name: this.name,
       stun: this.stun,
+      relay: this.relay,
+      relayState: this.session?.relayState ?? "off",
       site: d?.site ?? "",
       color: d ? colorFor(d.site) : OFF_UI.color,
     };
@@ -411,6 +452,8 @@ export class Collab {
       p.room === next.room &&
       p.name === next.name &&
       p.stun === next.stun &&
+      p.relay === next.relay &&
+      p.relayState === next.relayState &&
       p.site === next.site &&
       p.peers.length === next.peers.length &&
       p.peers.every((x, i) => x.site === next.peers[i].site && x.name === next.peers[i].name);

@@ -1904,19 +1904,35 @@ export class Whiteboard {
   /** L'host incolla il codice di risposta dell'ospite. */
   acceptAnswer = (text: string): ReturnType<Collab["acceptAnswer"]> => this.collab.acceptAnswer(text);
 
+  /** Link della stanza, riutilizzabile, per entrare con il collegamento automatico. */
+  getRoomLink = (): ReturnType<Collab["roomLink"]> => this.collab.roomLink();
+
+  /** Id di una lavagna della libreria che fa già parte della stanza `room` (null se nessuna). */
+  private boardInRoom(room: string): string | null {
+    for (const b of this.boards) {
+      if (b.id === this.boardId) continue;
+      if (readBoard(b.id)?.collab?.room === room) return b.id;
+    }
+    return null;
+  }
+
   /**
-   * L'ospite apre un invito. Se questa lavagna fa già parte di quella stanza si riconnette, altrimenti
-   * l'invito crea una NUOVA lavagna nella libreria (quella aperta non viene toccata né sincronizzata).
+   * L'ospite apre un invito. Se una lavagna della libreria fa già parte di quella stanza la riapre e si
+   * riconnette (stessa identità, niente doppioni), altrimenti l'invito crea una NUOVA lavagna nella
+   * libreria (quella aperta non viene toccata né sincronizzata).
+   * `answer` è il codice da rimandare all'host per un invito manuale, null con il link della stanza.
    */
   joinCollab = async (
     text: string,
     name: string,
-  ): Promise<{ ok: true; answer: string; resumed: boolean } | { ok: false; error: string }> => {
+  ): Promise<{ ok: true; answer: string | null; resumed: boolean } | { ok: false; error: string }> => {
     const inv = await Collab.parseInvite(text);
     if (!inv) return { ok: false, error: "Invito non valido o danneggiato" };
     if (this.editing) this.finishEdit();
 
-    if (this.collab.doc && this.collab.doc.room === inv.room) {
+    const existing = this.collab.doc?.room === inv.room ? this.boardId : this.boardInRoom(inv.room);
+    if (existing) {
+      this.openBoard(existing);
       const r = await this.collab.resume(inv, name);
       return r.ok ? { ...r, resumed: true } : r;
     }
@@ -1942,6 +1958,7 @@ export class Whiteboard {
   stopCollab = (): void => this.collab.stop();
   setCollabName = (name: string): void => this.collab.setName(name);
   setCollabStun = (stun: boolean): void => this.collab.setStun(stun);
+  setCollabRelay = (relay: boolean): void => this.collab.setRelay(relay);
 
   /* ======================================================================
    * Import / export

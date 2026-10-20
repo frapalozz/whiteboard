@@ -1,13 +1,17 @@
 import { colorFor, parseMsg, randomId, RX_FRAME_MAX, RX_MESSAGE_MAX, RX_PARTS_MAX, toFrames } from "./protocol";
+import { Relay, relaySupported, type RelayMsg, type RelayState } from "./relay";
 import { buildInviteUrl, decodeAnswer, encodeAnswer, encodeInvite, type Invite } from "./signaling";
 import type { Msg, PeerInfo } from "./types";
 
 /**
  * Trasporto P2P: una mesh completa di RTCPeerConnection, un canale dati affidabile per coppia.
  *
- * Nessun server di segnalazione. Il primo collegamento con una persona passa da un invito manuale
- * (vedi signaling.ts); da lì in poi chi entra riceve l'elenco dei partecipanti da chi lo ha accolto e
- * negozia le connessioni mancanti scambiando offerte/risposte *attraverso* i canali già aperti.
+ * Le offerte/risposte viaggiano in tre modi:
+ *   - attraverso il relay (relay.ts), se attivo: chi entra nella stanza si annuncia e si collega da solo,
+ *     e chi torna sulla pagina dopo una pausa (telefono in background) si ricollega senza nuovi inviti;
+ *   - con un invito manuale (signaling.ts): link + codice di risposta copiati a mano, senza alcun server;
+ *   - attraverso i canali già aperti: chi entra riceve l'elenco dei partecipanti e negozia le connessioni
+ *     mancanti tramite chi lo ha accolto.
  * Per evitare che due peer si chiamino a vicenda, è sempre quello con l'id maggiore a fare l'offerta.
  */
 
@@ -17,6 +21,8 @@ export interface SessionOpts {
   name: string;
   /** Usa un server STUN pubblico per attraversare i NAT (vede l'IP, mai i contenuti). */
   stun: boolean;
+  /** Segnalazione automatica attraverso broker pubblici (vedi relay.ts). */
+  relay: boolean;
 }
 
 export interface SessionEvents {
@@ -39,17 +45,33 @@ interface Conn {
   site: string | null;
   info: PeerInfo | null;
   ready: boolean;
+  /** Istante in cui il canale è diventato operativo. */
+  since: number;
   closed: boolean;
+  /** Nata da un invito manuale (codici copiati a mano). */
+  manual: boolean;
   queue: string[];
   rx: Map<string, Rx>;
   timers: Set<ReturnType<typeof setTimeout>>;
 }
 
-const STUN = [{ urls: "stun:stun.l.google.com:19302" }];
+/** Canale su cui passa la segnalazione: un peer già collegato o il relay. */
+type Via = Conn | "relay";
+
+const STUN = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] }];
 const MAX_INVITES = 6;
-const HI_TIMEOUT = 10_000;
+const HI_TIMEOUT = 15_000;
 const LINK_TIMEOUT = 25_000;
+/**
+ * Dopo che l'host ha incollato la risposta, l'ospite può essere ancora in un'altra app (ha appena mandato
+ * il codice): su telefono il browser in background è sospeso e il collegamento parte solo al suo ritorno.
+ */
+const MANUAL_LINK_TIMEOUT = 5 * 60_000;
 const GUEST_WAIT = 20 * 60_000;
+/** Annuncio periodico sul relay: ricuce le connessioni perse senza che nessuno faccia nulla. */
+const ANNOUNCE_MS = 20_000;
+/** Un canale aperto da meno di così non si considera "zombie" (l'altro può non averlo ancora registrato). */
+const STALE_GRACE = 15_000;
 const HIGH_WATER = 1 << 20;
 const LOW_WATER = 1 << 18;
 
@@ -81,6 +103,11 @@ export class CollabSession {
   private linking = new Map<string, Conn>();
   private invites = new Map<string, { conn: Conn; created: number }>();
   private bc: BroadcastChannel | null = null;
+  private relay: Relay | null = null;
+  private announceTimer: ReturnType<typeof setInterval> | null = null;
+  /** Ultima risposta mirata a un annuncio, per sito (limita il traffico). */
+  private replied = new Map<string, number>();
+  relayState: RelayState | "off" = "off";
   private dead = false;
   /** Impostato se un peer ha rifiutato/è stato rifiutato per stanza diversa. */
   roomMismatch = false;
@@ -98,6 +125,78 @@ export class CollabSession {
           this.acceptAnswer((d as { answer: string }).answer).catch(() => {});
         }
       };
+    }
+    this.setRelay(opts.relay);
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", this.onVisible);
+    if (typeof window !== "undefined") window.addEventListener("online", this.onVisible);
+  }
+
+  /* ---------------------------------------------------------------------
+   * Relay
+   * ------------------------------------------------------------------- */
+
+  setRelay(on: boolean): void {
+    this.opts.relay = on;
+    if (this.dead) return;
+    if (on && !this.relay && relaySupported()) {
+      this.relayState = "connecting";
+      this.relay = new Relay(
+        this.opts.room,
+        (m) => this.onRelay(m),
+        (s) => {
+          const was = this.relayState;
+          this.relayState = s;
+          if (s === "on" && was !== "on") this.announceAll();
+          if (s !== was) this.ev.onChange();
+        },
+      );
+      this.announceTimer = setInterval(() => {
+        if (typeof document === "undefined" || document.visibilityState === "visible") this.announceAll();
+      }, ANNOUNCE_MS);
+    } else if (!on && this.relay) {
+      this.relay.close();
+      this.relay = null;
+      if (this.announceTimer) clearInterval(this.announceTimer);
+      this.announceTimer = null;
+      this.relayState = "off";
+    }
+    this.ev.onChange();
+  }
+
+  /** Ritorno in primo piano (o in rete): i canali possono essere caduti nel frattempo, ci si riannuncia. */
+  private onVisible = (): void => {
+    if (this.dead || (typeof document !== "undefined" && document.visibilityState !== "visible")) return;
+    this.relay?.wake();
+    this.announceAll();
+  };
+
+  private announceAll(to?: string): void {
+    if (!this.relay?.ready) return;
+    void this.relay.send({ t: "here", from: this.opts.site, name: this.opts.name, peers: [...this.peers.keys()], to });
+  }
+
+  private onRelay(m: RelayMsg): void {
+    if (this.dead || m.from === this.opts.site) return;
+    if (m.t === "sig") {
+      if (m.to === this.opts.site) this.onSignal({ t: "sig", from: m.from, to: m.to, k: m.k, sdp: m.sdp }, "relay");
+      return;
+    }
+    if (m.to && m.to !== this.opts.site) return;
+    const cur = this.peers.get(m.from);
+    if (cur) {
+      // l'altro non ci vede più (es. il telefono ha sospeso la pagina): il nostro canale è uno zombie
+      if (m.peers.includes(this.opts.site) || Date.now() - cur.since < STALE_GRACE) return;
+      this.drop(cur);
+    }
+    if (this.linking.has(m.from)) return;
+    if (this.opts.site > m.from) {
+      void this.initiate(m.from, "relay");
+    } else if (!m.to) {
+      // tocca all'altro fare l'offerta: gli diciamo che ci siamo
+      const last = this.replied.get(m.from) ?? 0;
+      if (Date.now() - last < 3000) return;
+      this.replied.set(m.from, Date.now());
+      this.announceAll(m.from);
     }
   }
 
@@ -148,13 +247,15 @@ export class CollabSession {
     if (c.pc.signalingState !== "have-local-offer") throw new Error("Risposta già usata");
     await c.pc.setRemoteDescription({ type: "answer", sdp: a.sdp });
     this.invites.delete(a.i);
-    this.timeout(c, LINK_TIMEOUT);
+    c.manual = true;
+    this.timeout(c, MANUAL_LINK_TIMEOUT);
     this.ev.onChange();
   }
 
   /** L'ospite elabora l'invito e produce il codice di risposta da mandare all'host. */
   async answerInvite(inv: Invite): Promise<string> {
     const c = this.makeConn();
+    c.manual = true;
     c.pc.ondatachannel = (e) => this.attach(c, e.channel);
     try {
       await c.pc.setRemoteDescription({ type: "offer", sdp: inv.sdp });
@@ -192,6 +293,12 @@ export class CollabSession {
     this.dead = true;
     this.bc?.close();
     this.bc = null;
+    this.relay?.close();
+    this.relay = null;
+    if (this.announceTimer) clearInterval(this.announceTimer);
+    this.announceTimer = null;
+    if (typeof document !== "undefined") document.removeEventListener("visibilitychange", this.onVisible);
+    if (typeof window !== "undefined") window.removeEventListener("online", this.onVisible);
     const all = [...this.conns];
     this.invites.clear();
     this.linking.clear();
@@ -226,10 +333,12 @@ export class CollabSession {
 
   private makeConn(): Conn {
     const pc = new RTCPeerConnection({ iceServers: this.opts.stun ? STUN : [] });
-    const c: Conn = { pc, dc: null, site: null, info: null, ready: false, closed: false, queue: [], rx: new Map(), timers: new Set() };
+    const c: Conn = { pc, dc: null, site: null, info: null, ready: false, since: 0, closed: false, manual: false, queue: [], rx: new Map(), timers: new Set() };
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
-      if (s === "failed" || s === "closed") this.drop(c);
+      // un invito manuale non ancora aperto resta in attesa: l'altro può essere momentaneamente in background
+      // (il timeout dedicato lo chiuderà se non torna); per tutto il resto un errore chiude il canale
+      if (s === "closed" || (s === "failed" && !(c.manual && !c.ready))) this.drop(c);
       else if (s === "disconnected") {
         const t = setTimeout(() => pc.connectionState === "disconnected" && this.drop(c), 8000);
         c.timers.add(t);
@@ -284,6 +393,8 @@ export class CollabSession {
     if (c.site && this.peers.get(c.site) === c) {
       this.peers.delete(c.site);
       this.ev.onPeerClose(c.site);
+      // magari è solo una pausa: chi è ancora qui si fa ritrovare
+      setTimeout(() => this.announceAll(), 1500);
     }
     this.ev.onChange();
   }
@@ -343,10 +454,14 @@ export class CollabSession {
           this.drop(c);
           return;
         }
-        if (msg.site === this.opts.site || this.peers.has(msg.site)) return this.drop(c);
+        if (msg.site === this.opts.site) return this.drop(c);
+        // un nuovo canale con chi risulta già collegato: quello vecchio è morto senza che ce ne accorgessimo
+        const old = this.peers.get(msg.site);
+        if (old) this.drop(old);
         c.site = msg.site;
         c.info = { site: msg.site, name: msg.name, color: colorFor(msg.site) };
         c.ready = true;
+        c.since = Date.now();
         this.peers.set(msg.site, c);
         this.linking.delete(msg.site);
         this.ev.onPeerOpen(c.info);
@@ -380,12 +495,17 @@ export class CollabSession {
     }
   }
 
-  private consider(site: string, via: Conn): void {
+  private sendSig(via: Via, msg: Extract<Msg, { t: "sig" }>): void {
+    if (via === "relay") void this.relay?.send(msg);
+    else this.sendConn(via, msg);
+  }
+
+  private consider(site: string, via: Via): void {
     if (site === this.opts.site || this.peers.has(site) || this.linking.has(site)) return;
     if (this.opts.site > site) void this.initiate(site, via);
   }
 
-  private async initiate(target: string, via: Conn): Promise<void> {
+  private async initiate(target: string, via: Via): Promise<void> {
     const c = this.makeConn();
     this.linking.set(target, c);
     try {
@@ -394,15 +514,16 @@ export class CollabSession {
       await gathered(c.pc);
       const sdp = c.pc.localDescription?.sdp;
       if (!sdp || c.closed) return this.drop(c);
-      this.sendConn(via, { t: "sig", from: this.opts.site, to: target, k: "offer", sdp });
+      this.sendSig(via, { t: "sig", from: this.opts.site, to: target, k: "offer", sdp });
       this.timeout(c, LINK_TIMEOUT);
     } catch {
       this.drop(c);
     }
   }
 
-  private onSignal(msg: Extract<Msg, { t: "sig" }>, via: Conn): void {
+  private onSignal(msg: Extract<Msg, { t: "sig" }>, via: Via): void {
     if (msg.to !== this.opts.site) {
+      if (via === "relay") return;
       // non è per me: lo inoltro se conosco il destinatario
       const next = this.peers.get(msg.to);
       if (next && next !== via) this.sendConn(next, msg);
@@ -412,9 +533,12 @@ export class CollabSession {
     else void this.onAnswer(msg);
   }
 
-  private async onOffer(msg: Extract<Msg, { t: "sig" }>, via: Conn): Promise<void> {
+  private async onOffer(msg: Extract<Msg, { t: "sig" }>, via: Via): Promise<void> {
     const from = msg.from;
-    if (this.peers.has(from) || this.linking.has(from)) return;
+    if (from === this.opts.site || this.linking.has(from)) return;
+    // chi offre non ci considera collegati: il canale che abbiamo con lui è uno zombie
+    const old = this.peers.get(from);
+    if (old) this.drop(old);
     const c = this.makeConn();
     this.linking.set(from, c);
     c.pc.ondatachannel = (e) => this.attach(c, e.channel);
@@ -424,7 +548,7 @@ export class CollabSession {
       await gathered(c.pc);
       const sdp = c.pc.localDescription?.sdp;
       if (!sdp || c.closed) return this.drop(c);
-      this.sendConn(via, { t: "sig", from: this.opts.site, to: from, k: "answer", sdp });
+      this.sendSig(via, { t: "sig", from: this.opts.site, to: from, k: "answer", sdp });
       this.timeout(c, LINK_TIMEOUT);
     } catch {
       this.drop(c);
