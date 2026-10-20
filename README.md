@@ -18,7 +18,7 @@ npm run typecheck
 - **Camera**: pan con rotella/trackpad, Spazio+trascina, tasto destro o centrale; zoom con Ctrl+rotella/pinch ancorato al cursore; pinch e pan a due dita su touch; "adatta al contenuto".
 - **Undo/redo** illimitati nella pratica (200 passi), anche per gomma, import e svuota.
 - **Libreria di lavagne** salvata nel browser (localStorage): crea, apri, rinomina, duplica ed elimina lavagne dal
-  pannello "Le mie lavagne", con anteprima. Ogni lavagna si salva da sola (contenuto, vista, sfondo) e si riapre
+  pannello "Le mie lavagne", con anteprima (su telefono come elenco compatto). "Seleziona" permette di eliminarne più insieme. Ogni lavagna si salva da sola (contenuto, vista, sfondo) e si riapre
   com'era. Chi arriva dalla versione a lavagna singola trova il suo lavoro migrato in "Lavagna 1".
 - **Export / import**: PNG di tutto il contenuto, JSON di una lavagna (dal menu File o dalla card in libreria).
   Importare un `.json` crea sempre una *nuova* lavagna, senza toccare quella aperta.
@@ -28,8 +28,10 @@ npm run typecheck
   dall'indirizzo, così un ricaricamento non la importa due volte. Le coordinate sono arrotondate al centesimo.
   Lavagne molto ricche generano link lunghi: oltre ~8 KB alcune app di messaggistica possono troncarli (l'app avvisa);
   oltre ~1,5 MB il link viene rifiutato e conviene l'export `.json`.
-- **Collaborazione in tempo reale (P2P)**: più persone disegnano sulla stessa lavagna via WebRTC, **senza server**. Pulsante
-  "Collabora" in alto a destra: si crea un link d'invito per persona, l'ospite risponde con un codice, e il canale si apre.
+- **Collaborazione in tempo reale (P2P)**: più persone disegnano sulla stessa lavagna via WebRTC, i disegni passano solo da
+  dispositivo a dispositivo. Pulsante "Collabora" in alto a destra: si manda un link e chi lo apre entra da solo (collegamento
+  automatico); se il telefono mette il browser in background o la pagina si ricarica, la connessione si riforma da sola.
+  Resta disponibile l'invito manuale (link + codice di risposta) senza alcun server.
   Cursori con nome, tratti visibili mentre vengono disegnati, undo/redo che annulla solo le *tue* azioni. Vedi sotto.
 - **Interfaccia**: pannelli "vetro" chiari o scuri secondo il tema del sistema, strumenti raggruppati con tooltip e
   scorciatoie, pannello proprietà contestuale, notifiche, layout adattato a mobile e touch.
@@ -69,15 +71,27 @@ src/components/  WhiteBoard (composizione), Canvas, TextEditor, Toolbar, Propert
 src/engine/collab/
   doc.ts          CRDT: una voce per elemento (versione di Lamport, sito, chiave d'ordine z, lapide); merge "ultima scrittura vince"
   protocol.ts     validazione dei messaggi di rete (i peer non sono fidati), frammentazione, colori/nomi
-  signaling.ts    inviti e risposte: SDP compressa nel fragment dell'URL (#collab=…), mai inviata a un server
+  signaling.ts    link della stanza e inviti manuali (SDP compressa) nel fragment dell'URL (#collab=…)
+  relay.ts        segnalazione automatica: client MQTT minimo su WebSocket verso broker pubblici, messaggi cifrati AES-GCM
   session.ts      mesh WebRTC: un canale dati per coppia, segnalazione assistita dai peer già collegati, backpressure
   controller.ts   unisce documento, trasporto e presenza; si aggancia al motore tramite l'interfaccia CollabHost
   validate.ts     validatori puri (usati anche da storage.ts)
 src/components/CollabDialog.tsx   interfaccia (avvio, inviti, partecipanti, privacy)
 ```
 
-**Come si collega.** WebRTC ha bisogno che due browser si scambino un'offerta e una risposta. Senza server lo scambio è manuale:
-l'host crea un link d'invito, l'ospite lo apre e ottiene un codice di risposta, l'host lo incolla. È un passaggio per persona: dopo il
+**Come si collega.** WebRTC ha bisogno che due browser si scambino un'offerta e una risposta.
+
+*Collegamento automatico (predefinito).* Il link della stanza contiene solo l'id della stanza (128 bit casuali). Da quello ogni
+partecipante ricava un topic e una chiave AES-GCM, e usa alcuni broker MQTT pubblici (emqx, hivemq, mosquitto, in parallelo) come
+bacheca: si annuncia ("ci sono, e sono collegato a…") e scambia offerte/risposte cifrate. Il broker vede solo blob opachi; i disegni
+non ci passano mai. L'annuncio si ripete ogni 20 s, al ritorno in primo piano e al ritorno in rete: per questo un telefono che
+sospende il browser mentre si manda il link, o una scheda scartata e ricaricata, si ricollega da solo. Un annuncio che non ci
+elenca rivela anche le connessioni "zombie" (canale che sembra aperto ma che l'altro ha perso), che vengono sostituite.
+Lo si disattiva da "Privacy e impostazioni".
+
+*Invito manuale (senza alcun server).* L'host crea un link d'invito, l'ospite lo apre e ottiene un codice di risposta, l'host lo
+incolla. Il collegamento parte solo quando entrambi hanno la pagina aperta: l'host aspetta fino a 5 minuti che l'ospite torni sul
+browser dopo aver mandato il codice. È un passaggio per persona: dopo il
 primo collegamento, chi entra riceve l'elenco dei partecipanti e negozia le connessioni mancanti *attraverso* i canali già aperti
 (mesh completa). Tra schede dello stesso browser la risposta arriva da sola (BroadcastChannel).
 
@@ -88,14 +102,16 @@ una chiave frazionaria per elemento. Lo storico di undo/redo è ri-agganciato (`
 Durante un trascinamento locale gli aggiornamenti remoti aspettano la fine del gesto.
 
 **Local-first.** Ogni partecipante tiene la propria copia in localStorage (con i metadati di sincronizzazione), anche offline. Se ricarichi
-la pagina la lavagna resta; basta un nuovo invito di chi è ancora nella stanza per riconnettersi e riunire le modifiche.
-Chi apre un invito ottiene una *nuova* lavagna nella libreria. "Esci dalla collaborazione" la rende di nuovo una lavagna normale.
+la pagina la lavagna resta e, con il collegamento automatico, rientra nella stanza da sola (con l'invito manuale serve un nuovo
+invito di chi è ancora nella stanza). Chi apre un invito ottiene una *nuova* lavagna nella libreria, a meno che ne abbia già una
+di quella stanza: in quel caso viene riaperta quella, senza doppioni. "Esci dalla collaborazione" la rende di nuovo una lavagna normale.
 
 **Limiti e fiducia.**
-- Chi ha il link d'invito e risponde è un partecipante a pieno titolo (può modificare e cancellare): non c'è autenticazione.
-- Con una rete molto restrittiva (NAT simmetrico, firewall aziendali) il collegamento diretto può fallire senza un relay TURN, che qui non c'è.
+- Chi ha il link è un partecipante a pieno titolo (può modificare e cancellare): non c'è autenticazione.
+- Il collegamento automatico dipende da broker MQTT pubblici gratuiti: se nessuno è raggiungibile l'app lo dice e propone l'invito manuale.
+- Con una rete molto restrittiva (NAT simmetrico, firewall aziendali, alcune reti mobili 4G/5G) il collegamento diretto può fallire senza un relay TURN, che qui non c'è: in quel caso conviene il Wi-Fi.
 - Il server STUN pubblico (opzionale, attivo di default) vede l'IP, mai i contenuti. Disattivato, funziona solo nella stessa rete locale.
-- Una collaborazione è legata alla lavagna aperta: cambiando lavagna la sessione si chiude (si riprende con un nuovo invito).
+- Una collaborazione è legata alla lavagna aperta: cambiando lavagna la sessione si chiude (si riprende riaprendola, o con un nuovo invito senza relay).
 - Le lapidi non vengono ripulite: lavagne molto vecchie e molto editate crescono un po' nel tempo.
 - La chiave d'ordine z è un numero in virgola mobile: moltissimi inserimenti nello stesso punto esatto ne esauriscono la precisione.
 
@@ -105,7 +121,7 @@ Chi apre un invito ottiene una *nuova* lavagna nella libreria. "Esci dalla colla
 |---|---|
 | `whiteboard:index` | elenco lavagne (id, nome, date, anteprima) e lavagna corrente |
 | `whiteboard:board:<id>` | una lavagna: elementi, camera, sfondo, griglia (e metadati di sincronizzazione se collaborativa) |
-| `whiteboard:collab` | nome visualizzato e preferenza STUN |
+| `whiteboard:collab` | nome visualizzato e preferenze STUN e collegamento automatico |
 
 localStorage ha un limite di pochi MB per sito: se si esaurisce, l'app continua a funzionare in memoria e lo segnala
 sotto il nome della lavagna. In quel caso esporta in `.json` ed elimina le lavagne che non servono.

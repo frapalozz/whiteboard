@@ -10,6 +10,9 @@ import { deflate, fromBase64Url, hasStreams, inflate, toBase64Url } from "../sha
  *   3. l'ospite lo manda all'host, che lo incolla. Il canale si apre.
  * Dopo il primo collegamento, gli altri partecipanti si scambiano offerte e risposte attraverso i canali
  * già aperti (vedi session.ts), quindi l'invito manuale serve una sola volta per persona.
+ *
+ * Con il relay attivo (relay.ts) basta invece un "link della stanza": contiene solo l'id della stanza (che
+ * fa anche da chiave di cifratura per il relay), vale per quante persone si vuole e non scade.
  */
 
 export const COLLAB_PARAM = "collab";
@@ -28,6 +31,17 @@ export interface Invite {
   b: string;
   sdp: string;
 }
+
+/** Link della stanza: per entrare con il relay, senza codici da rimandare indietro. */
+export interface RoomInvite {
+  room: string;
+  /** nome dell'host */
+  n: string;
+  /** nome della lavagna */
+  b: string;
+}
+
+export type AnyInvite = ({ kind: "offer" } & Invite) | ({ kind: "room" } & RoomInvite);
 
 export interface Answer {
   i: string;
@@ -71,21 +85,29 @@ export async function encodeInvite(inv: Invite): Promise<string> {
   return pack({ v: 1, k: "o", ...inv });
 }
 
+export async function encodeRoomInvite(inv: RoomInvite): Promise<string> {
+  return pack({ v: 2, k: "r", ...inv });
+}
+
 export async function encodeAnswer(a: Answer): Promise<string> {
   return pack({ v: 1, k: "a", ...a });
 }
 
-export async function decodeInvite(text: string): Promise<Invite | null> {
+export async function decodeInvite(text: string): Promise<AnyInvite | null> {
   try {
     const d = (await unpack(extractCode(text))) as Record<string, unknown>;
+    const n = typeof d.n === "string" ? d.n.slice(0, 24) : "";
+    const b = typeof d.b === "string" ? d.b.slice(0, 80) : "";
+    if (d.v === 2 && d.k === "r") return isStr(d.room, 100) ? { kind: "room", room: d.room, n, b } : null;
     if (d.v !== 1 || d.k !== "o") return null;
     if (!isStr(d.i, 40) || !isStr(d.room, 100) || !isStr(d.s, 40) || !isSdp(d.sdp)) return null;
     return {
+      kind: "offer",
       i: d.i,
       room: d.room,
       s: d.s,
-      n: typeof d.n === "string" ? d.n.slice(0, 24) : "",
-      b: typeof d.b === "string" ? d.b.slice(0, 80) : "",
+      n,
+      b,
       sdp: d.sdp,
     };
   } catch {

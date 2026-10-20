@@ -71,6 +71,10 @@ export interface CollabUI {
   peers: PeerInfo[];
   name: string;
   stun: boolean;
+  /** Preferenza: collegamento automatico attraverso il relay. */
+  relay: boolean;
+  /** Stato del relay per la sessione corrente. */
+  relayState: "off" | "connecting" | "on" | "error";
   /** Sito locale (serve a mostrare il tuo colore). */
   site: string;
   color: string;
@@ -78,4 +82,4 @@ export interface CollabUI {
 
 export const MAX_ENTRIES = 200_000;
 
-export const OFF_UI: CollabUI = { mode: "off", room: "", peers: [], name: "", stun: true, site: "", color: "#4c8dff" };
+export const OFF_UI: CollabUI = { mode: "off", room: "", peers: [], name: "", stun: true, relay: true, relayState: "off", site: "", color: "#4c8dff" };
