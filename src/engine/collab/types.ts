@@ -24,6 +24,8 @@ export interface Wire {
 export interface WireProps {
   bg?: Reg<string>;
   grid?: Reg<GridMode>;
+  /** Numero di pagine della modalità lezione (0 = lavagna infinita). */
+  pg?: Reg<number>;
 }
 
 export interface Batch {
@@ -43,6 +45,10 @@ export type Msg =
   /** Forma in corso (linea, freccia, rettangolo, ellisse). */
   | { t: "dr"; el: El }
   | { t: "dend"; id: string }
+  /** Area visibile in coordinate mondo: serve a chi segue questo partecipante. */
+  | { t: "vw"; x: number; y: number; w: number; h: number }
+  /** "Fatti seguire": chi lo riceve inizia (o smette) di seguire chi lo manda. */
+  | { t: "lead"; on: boolean }
   | { t: "bye" };
 
 export interface PeerInfo {
@@ -61,6 +67,7 @@ export interface CollabSaved {
   entries: Array<[string, number, string, number, 0 | 1]>;
   bg?: Reg<string>;
   grid?: Reg<GridMode>;
+  pages?: Reg<number>;
 }
 
 /** Parte dello stato osservabile dalla UI. */
@@ -78,8 +85,14 @@ export interface CollabUI {
   /** Sito locale (serve a mostrare il tuo colore). */
   site: string;
   color: string;
+  /** true se stai chiedendo a tutti di seguire la tua vista. */
+  leading: boolean;
+  /** Sito del partecipante di cui segui la vista (null: nessuno). */
+  following: string | null;
+  /** Siti dei partecipanti che chiedono di essere seguiti. */
+  leaders: string[];
 }
 
 export const MAX_ENTRIES = 200_000;
 
-export const OFF_UI: CollabUI = { mode: "off", room: "", peers: [], name: "", stun: true, relay: true, relayState: "off", site: "", color: "#4c8dff" };
+export const OFF_UI: CollabUI = { mode: "off", room: "", peers: [], name: "", stun: true, relay: true, relayState: "off", site: "", color: "#4c8dff", leading: false, following: null, leaders: [] };

@@ -23,7 +23,7 @@ import {
   unionRects,
 } from "./geometry";
 import { Collab, type CollabHost } from "./collab/controller";
-import { drawElement, drawElements, drawGrid, isDark } from "./render";
+import { drawElement, drawElements, drawGrid, drawPages, isDark } from "./render";
 import { buildShareUrl, SHARE_HARD_LIMIT } from "./share";
 import {
   downloadBlob,
@@ -38,7 +38,7 @@ import {
   writeBoard,
   writeIndex,
 } from "./storage";
-import { MAX_ZOOM, MIN_ZOOM } from "./types";
+import { MAX_PAGES, MAX_ZOOM, MIN_ZOOM, PAGE_GAP, PAGE_H, PAGE_STRIDE, PAGE_W, pageRect } from "./types";
 import type {
   BoardMeta,
   BoxEl,
@@ -121,6 +121,8 @@ export class Whiteboard {
   private camera: Camera = { x: 0, y: 0, zoom: 1 };
   private bgColor = DEFAULT_BG;
   private grid: GridMode = "dots";
+  /** Pagine della modalità lezione (0 = lavagna infinita). Vedi `pageCount()`. */
+  private pages = 0;
 
   /* ---- strumento / stile ---- */
   private tool: ToolId = "pen";
@@ -171,6 +173,10 @@ export class Whiteboard {
   private snapSeq = new WeakMap<El[], number>();
   /** Ultima posizione del puntatore in coordinate mondo (null: fuori dalla lavagna). */
   private presenceCursor: Point | null = null;
+  /** Vista di chi si segue arrivata durante un gesto: si applica alla fine (non si sposta il foglio sotto la penna). */
+  private pendingFollow: Rect | null = null;
+  /** Pagine occupate dal contenuto, in cache per array di elementi (immutabile). */
+  private usedPages = new WeakMap<El[], number>();
 
   /* ---- store osservabile ---- */
   private listeners = new Set<() => void>();
@@ -239,6 +245,8 @@ export class Whiteboard {
       boards: this.boards,
       saveState: this.saveState,
       lastSaved: this.lastSaved,
+      pageCount: this.pageCount(),
+      page: this.currentPage(),
       collab: this.collab.ui,
     };
   }
@@ -322,6 +330,8 @@ export class Whiteboard {
     c.width = Math.round(this.viewW * this.dpr);
     c.height = Math.round(this.viewH * this.dpr);
     this.requestRender();
+    // chi segue riceve l'area visibile, che cambia con la finestra
+    this.collab.ping();
   }
 
   /* ======================================================================
@@ -363,11 +373,16 @@ export class Whiteboard {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // sfondo + griglia (spazio schermo)
+    // sfondo + griglia (spazio schermo); in modalità lezione i fogli
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = this.bgColor;
-    ctx.fillRect(0, 0, this.viewW, this.viewH);
-    drawGrid(ctx, this.camera, this.viewW, this.viewH, this.grid, isDark(this.bgColor));
+    const pages = this.pageCount();
+    if (pages > 0) {
+      drawPages(ctx, this.camera, this.viewW, this.viewH, pages, this.bgColor, this.grid, this.currentPage());
+    } else {
+      ctx.fillStyle = this.bgColor;
+      ctx.fillRect(0, 0, this.viewW, this.viewH);
+      drawGrid(ctx, this.camera, this.viewW, this.viewH, this.grid, isDark(this.bgColor));
+    }
 
     // contenuto (spazio mondo)
     ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, -x * zoom * dpr, -y * zoom * dpr);
@@ -754,14 +769,55 @@ export class Whiteboard {
     this.requestRender();
     this.scheduleSave();
     this.emit();
+    this.collab.ping();
   }
 
-  zoomIn = (): void => this.zoomAt({ x: this.viewW / 2, y: this.viewH / 2 }, this.camera.zoom * 1.25);
-  zoomOut = (): void => this.zoomAt({ x: this.viewW / 2, y: this.viewH / 2 }, this.camera.zoom * 0.8);
-  resetZoom = (): void => this.zoomAt({ x: this.viewW / 2, y: this.viewH / 2 }, 1);
+  /** L'utente sposta la vista da solo: se stava seguendo qualcuno, smette. */
+  private userCamera(): void {
+    this.collab.unfollow();
+    this.pendingFollow = null;
+  }
+
+  zoomIn = (): void => {
+    this.userCamera();
+    this.zoomAt({ x: this.viewW / 2, y: this.viewH / 2 }, this.camera.zoom * 1.25);
+  };
+  zoomOut = (): void => {
+    this.userCamera();
+    this.zoomAt({ x: this.viewW / 2, y: this.viewH / 2 }, this.camera.zoom * 0.8);
+  };
+  resetZoom = (): void => {
+    this.userCamera();
+    this.zoomAt({ x: this.viewW / 2, y: this.viewH / 2 }, 1);
+  };
 
   zoomToFit = (): void => {
+    this.userCamera();
+    this.fitContent();
+  };
+
+  /** Mostra un'area del mondo il più grande possibile, lasciando i margini indicati (px schermo). */
+  private showRect(r: Rect, pad: { top: number; right: number; bottom: number; left: number }, maxZoom = MAX_ZOOM): void {
+    // su schermi piccoli i margini non possono mangiarsi tutta la vista
+    const k = Math.min(1, (this.viewW * 0.3) / (pad.left + pad.right), (this.viewH * 0.3) / (pad.top + pad.bottom));
+    const p = { top: pad.top * k, right: pad.right * k, bottom: pad.bottom * k, left: pad.left * k };
+    const availW = Math.max(1, this.viewW - p.left - p.right);
+    const availH = Math.max(1, this.viewH - p.top - p.bottom);
+    const z = clamp(Math.min(availW / Math.max(r.w, 1), availH / Math.max(r.h, 1)), MIN_ZOOM, maxZoom);
+    this.camera = {
+      zoom: z,
+      x: r.x + r.w / 2 - (p.left + availW / 2) / z,
+      y: r.y + r.h / 2 - (p.top + availH / 2) / z,
+    };
+    this.cameraChanged();
+  }
+
+  private fitContent(): void {
     const b = unionRects(this.elements.map(boundsOf));
+    if (!b && this.pageCount() > 0) {
+      this.showRect(pageRect(0), this.pagePadding());
+      return;
+    }
     if (!b) {
       this.camera = { x: 0, y: 0, zoom: 1 };
       this.cameraChanged();
@@ -779,7 +835,153 @@ export class Whiteboard {
       y: b.y + b.h / 2 - this.viewH / z / 2,
     };
     this.cameraChanged();
+  }
+
+  /* ======================================================================
+   * Modalità lezione: pagine in sequenza
+   * ==================================================================== */
+
+  /** Pagina a cui appartiene un elemento (dal centro del suo riquadro), -1 se è fuori dalla colonna dei fogli. */
+  private pageOf(el: El): number {
+    const b = boundsOf(el);
+    const cx = b.x + b.w / 2;
+    const cy = b.y + b.h / 2;
+    if (cx < -PAGE_GAP || cx > PAGE_W + PAGE_GAP || cy < -PAGE_GAP / 2) return -1;
+    return Math.floor((cy + PAGE_GAP / 2) / PAGE_STRIDE);
+  }
+
+  /**
+   * Numero di pagine mostrate: quelle impostate, o di più se c'è contenuto più in basso (per esempio dopo
+   * aver annullato l'eliminazione di una pagina, o con il disegno di un altro partecipante).
+   */
+  private pageCount(): number {
+    if (this.pages <= 0) return 0;
+    let used = this.usedPages.get(this.elements);
+    if (used === undefined) {
+      used = 0;
+      for (const el of this.elements) used = Math.max(used, this.pageOf(el) + 1);
+      this.usedPages.set(this.elements, used);
+    }
+    return Math.min(MAX_PAGES, Math.max(this.pages, used));
+  }
+
+  /** Pagina più vicina al centro della vista. */
+  private currentPage(): number {
+    const n = this.pageCount();
+    if (n === 0 || this.viewH === 0) return 0;
+    const cy = this.camera.y + this.viewH / this.camera.zoom / 2;
+    return clamp(Math.round((cy - PAGE_H / 2) / PAGE_STRIDE), 0, n - 1);
+  }
+
+  /** Attiva o disattiva le pagine. Il contenuto non si sposta: i fogli partono da (0, 0). */
+  setPagesMode = (on: boolean): void => {
+    if (on === this.pages > 0) return;
+    if (this.editing) this.finishEdit();
+    this.pages = on ? 1 : 0;
+    if (on) {
+      this.pages = Math.max(1, this.pageCount());
+      this.goToPage(0);
+    }
+    this.changed();
   };
+
+  /** Mostra la pagina `i` intera, lasciando spazio alle barre degli strumenti. */
+  goToPage = (i: number): void => {
+    const n = this.pageCount();
+    if (n === 0) return;
+    if (this.editing) this.finishEdit();
+    this.userCamera();
+    this.showRect(pageRect(clamp(Math.round(i), 0, n - 1)), this.pagePadding());
+  };
+
+  /**
+   * Margini (px schermo) per inquadrare una pagina senza che le barre la coprano: sul telefono le barre
+   * stanno in alto e in basso, su schermi larghi il pannello dello stile occupa la sinistra.
+   */
+  private pagePadding(): { top: number; right: number; bottom: number; left: number } {
+    if (this.viewW < 768) return { top: 120, right: 12, bottom: 150, left: 12 };
+    if (this.viewW < 1024) return { top: 72, right: 24, bottom: 132, left: 264 };
+    return { top: 72, right: 24, bottom: 84, left: 264 };
+  }
+
+  nextPage = (): void => this.goToPage(this.currentPage() + 1);
+  prevPage = (): void => this.goToPage(this.currentPage() - 1);
+
+  /** Aggiunge una pagina in fondo e la mostra. */
+  addPage = (): void => {
+    const n = this.pageCount();
+    if (n === 0 || n >= MAX_PAGES) return;
+    this.pages = n + 1;
+    this.changed();
+    this.goToPage(n);
+  };
+
+  /** Contenuto della pagina `i` (serve alla UI per chiedere conferma prima di eliminarla). */
+  pageHasContent = (i: number): boolean => this.elements.some((el) => this.pageOf(el) === i);
+
+  /**
+   * Elimina la pagina `i` con il suo contenuto; le pagine successive salgono di un posto.
+   * Si annulla con Ctrl+Z (il contenuto torna al suo posto e il numero di pagine si ricalcola).
+   */
+  deletePage = (i: number): void => {
+    const n = this.pageCount();
+    if (n <= 1 || i < 0 || i >= n) return;
+    if (this.editing) this.finishEdit();
+    const next: El[] = [];
+    let touched = false;
+    for (const el of this.elements) {
+      const p = this.pageOf(el);
+      if (p === i) {
+        touched = true;
+        continue;
+      }
+      if (p > i) {
+        touched = true;
+        next.push(translateEl(el, 0, -PAGE_STRIDE));
+      } else {
+        next.push(el);
+      }
+    }
+    if (touched) {
+      this.record();
+      this.elements = next;
+      this.pruneSelection();
+    }
+    this.pages = n - 1;
+    this.changed();
+    this.goToPage(Math.min(i, n - 2));
+  };
+
+  /* ---- segui l'insegnante ---- */
+
+  /** Chiede a tutti i partecipanti di seguire la tua vista. */
+  setLeading = (on: boolean): void => this.collab.setLeading(on);
+
+  /** Segue la vista di un partecipante (null: smette di seguire). */
+  followPeer = (site: string | null): void => {
+    this.pendingFollow = null;
+    this.collab.follow(site);
+  };
+
+  /** Area del mondo visibile in questo momento. */
+  private visibleRect(): Rect {
+    return { x: this.camera.x, y: this.camera.y, w: this.viewW / this.camera.zoom, h: this.viewH / this.camera.zoom };
+  }
+
+  private followView(view: Rect): void {
+    // a metà di un tratto o di un trascinamento la vista non si muove: si aspetta la fine del gesto
+    if (this.action || this.gesture) {
+      this.pendingFollow = view;
+      return;
+    }
+    this.pendingFollow = null;
+    this.showRect(view, { top: 0, right: 0, bottom: 0, left: 0 });
+  }
+
+  private applyPendingFollow(): void {
+    const v = this.pendingFollow;
+    if (v && !this.action && !this.gesture && this.collab.isFollowing) this.followView(v);
+  }
 
   /* ======================================================================
    * Testo
@@ -869,6 +1071,7 @@ export class Whiteboard {
 
   private beginGesture(): void {
     this.cancelAction();
+    this.userCamera();
     const pts = [...this.pointers.values()];
     if (pts.length < 2) return;
     const [a, b] = pts;
@@ -919,6 +1122,7 @@ export class Whiteboard {
     this.emit();
     this.collab.flush();
     this.collab.ping();
+    this.applyPendingFollow();
   }
 
   /* ======================================================================
@@ -1073,6 +1277,7 @@ export class Whiteboard {
 
     switch (a.kind) {
       case "pan": {
+        this.userCamera();
         this.camera.x -= (p.x - a.last.x) / this.camera.zoom;
         this.camera.y -= (p.y - a.last.y) / this.camera.zoom;
         a.last = p;
@@ -1159,7 +1364,10 @@ export class Whiteboard {
 
   private endPointer(e: PointerEvent, cancelled: boolean): void {
     this.pointers.delete(e.pointerId);
-    if (this.pointers.size < 2) this.gesture = null;
+    if (this.pointers.size < 2 && this.gesture) {
+      this.gesture = null;
+      this.applyPendingFollow();
+    }
     try {
       this.canvas?.releasePointerCapture(e.pointerId);
     } catch {
@@ -1186,6 +1394,7 @@ export class Whiteboard {
     this.emit();
     this.collab.flush();
     this.collab.ping();
+    this.applyPendingFollow();
   }
 
   private finishAction(a: Action, e: PointerEvent): void {
@@ -1402,6 +1611,7 @@ export class Whiteboard {
 
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
+    this.userCamera();
     const p = this.screenPoint(e);
     let dx = e.deltaX;
     let dy = e.deltaY;
@@ -1491,6 +1701,21 @@ export class Whiteboard {
       return;
     }
     if (e.altKey) return;
+
+    // modalità lezione: Pagina giù/su, e le frecce quando non c'è niente di selezionato
+    if (this.pageCount() > 0 && !e.shiftKey) {
+      const noSel = this.selection.size === 0;
+      if (k === "pagedown" || (noSel && (k === "arrowright" || k === "arrowdown"))) {
+        e.preventDefault();
+        this.nextPage();
+        return;
+      }
+      if (k === "pageup" || (noSel && (k === "arrowleft" || k === "arrowup"))) {
+        e.preventDefault();
+        this.prevPage();
+        return;
+      }
+    }
 
     const step = (e.shiftKey ? 10 : 1) / this.camera.zoom;
     switch (k) {
@@ -1597,6 +1822,7 @@ export class Whiteboard {
       width: this.style.width,
       fill: this.style.fill,
       recentColors: this.recentColors,
+      pages: this.pages || undefined,
       // i metadati di sincronizzazione restano nel browser: mai in export, link o duplicati
       collab: forStorage ? this.collab.save() : undefined,
     };
@@ -1611,6 +1837,7 @@ export class Whiteboard {
     if (b.width) this.style.width = Math.round(clamp(b.width, MIN_WIDTH, MAX_WIDTH));
     if (typeof b.fill === "boolean") this.style.fill = b.fill;
     if (b.recentColors) this.recentColors = b.recentColors.slice(0, RECENT_MAX);
+    this.pages = b.pages ?? 0;
   }
 
   /** Riporta il documento a una lavagna vuota (stile dello strumento invariato). */
@@ -1628,6 +1855,8 @@ export class Whiteboard {
     this.camera = { x: 0, y: 0, zoom: 1 };
     this.bgColor = DEFAULT_BG;
     this.grid = "dots";
+    this.pages = 0;
+    this.pendingFollow = null;
   }
 
   private nextName(): string {
@@ -1861,9 +2090,10 @@ export class Whiteboard {
   private makeCollabHost(): CollabHost {
     return {
       getElements: () => this.elements,
-      getProps: () => ({ bgColor: this.bgColor, grid: this.grid }),
+      getProps: () => ({ bgColor: this.bgColor, grid: this.grid, pages: this.pages }),
       getBoardName: () => this.boardName,
-      getPresence: () => ({ cursor: this.presenceCursor, draft: this.draft }),
+      getPresence: () => ({ cursor: this.presenceCursor, draft: this.draft, view: this.canvas ? this.visibleRect() : null }),
+      followView: (v) => this.followView(v),
       // durante un trascinamento locale `elements` viene ricalcolato da uno snapshot: gli aggiornamenti
       // remoti aspettano la fine del gesto (vedi Collab.flush)
       isBusy: () => this.action?.kind === "move" || this.action?.kind === "resize",
@@ -1875,14 +2105,15 @@ export class Whiteboard {
   }
 
   /** Applica lo stato arrivato dagli altri partecipanti. Non entra nella history né viene rispedito. */
-  private setRemoteState(n: { elements?: El[]; bgColor?: string; grid?: GridMode; first?: boolean }): void {
+  private setRemoteState(n: { elements?: El[]; bgColor?: string; grid?: GridMode; pages?: number; first?: boolean }): void {
     if (n.elements) {
       this.elements = n.elements;
       this.pruneSelection();
     }
     if (n.bgColor) this.bgColor = n.bgColor;
     if (n.grid) this.grid = n.grid;
-    if (n.first) this.zoomToFit();
+    if (n.pages !== undefined) this.pages = n.pages;
+    if (n.first && !this.collab.isFollowing) this.fitContent();
     this.requestRender();
     this.scheduleSave();
     this.emit();
@@ -2007,7 +2238,8 @@ export class Whiteboard {
     this.boards = [...this.boards, meta];
     this.enterBoard(meta.id);
     this.applyBoard(board, false);
-    this.zoomToFit();
+    if (this.pages > 0) this.goToPage(0);
+    else this.fitContent();
     this.dirty = true;
     this.flushSave();
     this.requestRender();

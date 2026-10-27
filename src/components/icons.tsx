@@ -208,6 +208,40 @@ export const icons = {
       <path d="m6 9 6 6 6-6" />
     </Svg>
   ),
+  prev: (
+    <Svg>
+      <path d="m15 18-6-6 6-6" />
+    </Svg>
+  ),
+  next: (
+    <Svg>
+      <path d="m9 18 6-6-6-6" />
+    </Svg>
+  ),
+  pages: (
+    <Svg>
+      <rect x="6" y="3" width="13" height="15" rx="2" />
+      <path d="M4 7v12a2 2 0 0 0 2 2h10" />
+    </Svg>
+  ),
+  addPage: (
+    <Svg>
+      <rect x="5" y="3" width="14" height="18" rx="2" />
+      <path d="M12 9v6M9 12h6" />
+    </Svg>
+  ),
+  eye: (
+    <Svg>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
+      <circle cx="12" cy="12" r="3" />
+    </Svg>
+  ),
+  present: (
+    <Svg>
+      <rect x="3" y="4" width="18" height="12" rx="2" />
+      <path d="M12 16v4M8 20h8" />
+    </Svg>
+  ),
   style: (
     <Svg>
       <path d="M4 6h8M16 6h4M4 12h2M10 12h10M4 18h12M20 18h0" />

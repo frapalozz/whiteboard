@@ -1,4 +1,4 @@
-import type { GridMode } from "../types";
+import { MAX_PAGES, type GridMode } from "../types";
 import { MAX_ENTRIES, type CollabSaved, type Reg } from "./types";
 
 /**
@@ -6,7 +6,8 @@ import { MAX_ENTRIES, type CollabSaved, type Reg } from "./types";
  */
 
 export const MAX_CLOCK = 2 ** 40;
-export const GRIDS: GridMode[] = ["none", "dots", "lines"];
+/** L'ordine conta: il link di condivisione salva l'indice. Aggiungere solo in fondo. */
+export const GRIDS: GridMode[] = ["none", "dots", "lines", "squares", "ruled"];
 
 const HEX = /^#[0-9a-f]{3,8}$/i;
 
@@ -25,6 +26,11 @@ export function parseReg<T>(raw: unknown, val: (v: unknown) => T | null): Reg<T>
 
 export const parseBgReg = (raw: unknown): Reg<string> | null => parseReg(raw, parseColor);
 export const parseGridReg = (raw: unknown): Reg<GridMode> | null => parseReg(raw, parseGrid);
+
+/** Numero di pagine (0 = lavagna infinita), intero tra 0 e MAX_PAGES. */
+export const parsePages = (v: unknown): number | null =>
+  isNum(v) && v >= 0 && v <= MAX_PAGES && Math.floor(v) === v ? v : null;
+export const parsePagesReg = (raw: unknown): Reg<number> | null => parseReg(raw, parsePages);
 
 /** Valida i dati di collaborazione letti da localStorage. */
 export function parseSaved(raw: unknown): CollabSaved | undefined {
@@ -47,5 +53,6 @@ export function parseSaved(raw: unknown): CollabSaved | undefined {
     entries,
     bg: (raw.bg === undefined ? null : parseBgReg(raw.bg)) ?? undefined,
     grid: (raw.grid === undefined ? null : parseGridReg(raw.grid)) ?? undefined,
+    pages: (raw.pages === undefined ? null : parsePagesReg(raw.pages)) ?? undefined,
   };
 }

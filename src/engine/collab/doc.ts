@@ -1,7 +1,7 @@
 import { sanitizeElement } from "../storage";
 import type { El, GridMode } from "../types";
 import { MAX_ENTRIES, type Batch, type CollabSaved, type Reg, type Wire, type WireProps } from "./types";
-import { isNum, isObj, isStr, MAX_CLOCK, parseBgReg, parseGridReg } from "./validate";
+import { isNum, isObj, isStr, MAX_CLOCK, parseBgReg, parseGridReg, parsePagesReg } from "./validate";
 
 /**
  * Documento collaborativo.
@@ -38,6 +38,7 @@ const toWire = (id: string, e: Entry): Wire =>
 export interface Props {
   bgColor: string;
   grid: GridMode;
+  pages: number;
 }
 
 export interface ApplyResult {
@@ -55,6 +56,7 @@ export class CollabDoc {
   private touched = new Map<string, number>();
   private bg: Reg<string> | null = null;
   private grid: Reg<GridMode> | null = null;
+  private pages: Reg<number> | null = null;
 
   constructor(
     readonly room: string,
@@ -69,7 +71,7 @@ export class CollabDoc {
   /**
    * Confronta l'array del motore con lo stato noto e produce le operazioni da inviare.
    * `skip`: id modificati da remoto e non ancora applicati al motore (gesture in corso): non si toccano.
-   * `seedProps`: l'host adotta sfondo e griglia locali come valori iniziali (un ospite no, altrimenti
+   * `seedProps`: l'host adotta sfondo, griglia e pagine locali come valori iniziali (un ospite no, altrimenti
    * sovrascriverebbe quelli della lavagna a cui si unisce).
    */
   local(elements: El[], props: Props, skip?: Set<string>, seedProps = false): Batch | null {
@@ -104,6 +106,12 @@ export class CollabDoc {
     if ((seedProps || this.grid) && this.grid?.val !== props.grid) {
       this.grid = { v: ++this.clock, s: this.site, val: props.grid };
       (p ??= {}).grid = this.grid;
+    }
+    // le pagine si propagano anche se attivate in una stanza nata prima che esistessero (nessun registro):
+    // chi entra parte da 0 pagine, quindi non può sovrascrivere quelle della stanza
+    if ((seedProps || this.pages || props.pages > 0) && (this.pages?.val ?? 0) !== props.pages) {
+      this.pages = { v: ++this.clock, s: this.site, val: props.pages };
+      (p ??= {}).pg = this.pages;
     }
     return out.length || p ? { e: out, p } : null;
   }
@@ -195,6 +203,14 @@ export class CollabDoc {
         (fp ??= {}).grid = b.p.grid;
       }
     }
+    if (b.p?.pg) {
+      if (b.p.pg.v > this.clock) this.clock = b.p.pg.v;
+      if (!this.pages || newer(b.p.pg, this.pages)) {
+        this.pages = b.p.pg;
+        props = true;
+        (fp ??= {}).pg = b.p.pg;
+      }
+    }
 
     if (changed.size || props) {
       this.seq++;
@@ -203,9 +219,9 @@ export class CollabDoc {
     return { changed, props, forward: fwd.length || fp ? { e: fwd, p: fp } : null };
   }
 
-  /** Sfondo e griglia correnti secondo il documento (undefined se mai impostati). */
+  /** Sfondo, griglia e pagine correnti secondo il documento (undefined se mai impostati). */
   currentProps(): Partial<Props> {
-    return { bgColor: this.bg?.val, grid: this.grid?.val };
+    return { bgColor: this.bg?.val, grid: this.grid?.val, pages: this.pages?.val };
   }
 
   /* ---------------------------------------------------------------------
@@ -274,6 +290,7 @@ export class CollabDoc {
     const props: WireProps = {};
     if (this.bg) props.bg = this.bg;
     if (this.grid) props.grid = this.grid;
+    if (this.pages) props.pg = this.pages;
     const batches: Batch[] = [];
     for (let i = 0; i < all.length; i += chunk) batches.push({ e: all.slice(i, i + chunk) });
     if (batches.length === 0) batches.push({ e: [] });
@@ -292,6 +309,7 @@ export class CollabDoc {
       entries,
       bg: this.bg ?? undefined,
       grid: this.grid ?? undefined,
+      pages: this.pages ?? undefined,
     };
   }
 
@@ -305,6 +323,7 @@ export class CollabDoc {
     }
     doc.bg = saved.bg ?? null;
     doc.grid = saved.grid ?? null;
+    doc.pages = saved.pages ?? null;
     return doc;
   }
 }
@@ -335,10 +354,12 @@ export function parseBatch(raw: unknown): Batch | null {
     if (!isObj(raw.p)) return null;
     const bg = raw.p.bg === undefined ? null : parseBgReg(raw.p.bg);
     const grid = raw.p.grid === undefined ? null : parseGridReg(raw.p.grid);
-    if (bg || grid) {
+    const pg = raw.p.pg === undefined ? null : parsePagesReg(raw.p.pg);
+    if (bg || grid || pg) {
       p = {};
       if (bg) p.bg = bg;
       if (grid) p.grid = grid;
+      if (pg) p.pg = pg;
     }
   }
   return { e, p };

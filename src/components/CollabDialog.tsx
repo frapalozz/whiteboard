@@ -314,13 +314,41 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
               <span className={label}>Partecipanti</span>
               <ul className="flex flex-col gap-1.5">
                 {you}
-                {c.peers.map((p) => (
-                  <li key={p.site} className="flex items-center gap-2 text-sm">
-                    <Dot color={p.color} />
-                    <span className="truncate">{p.name}</span>
-                  </li>
-                ))}
+                {c.peers.map((p) => {
+                  const followingThis = c.following === p.site;
+                  return (
+                    <li key={p.site} className="flex items-center gap-2 text-sm">
+                      <Dot color={p.color} />
+                      <span className="min-w-0 flex-1 truncate">
+                        {p.name}
+                        {c.leaders.includes(p.site) && <span className={`ml-1.5 text-xs ${subtle}`}>guida la lezione</span>}
+                      </span>
+                      <button
+                        type="button"
+                        aria-pressed={followingThis}
+                        title={followingThis ? "Smetti di seguire la sua vista" : "Mostra quello che sta guardando"}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => wb.followPeer(followingThis ? null : p.site)}
+                        className={`shrink-0 rounded-lg px-2 py-1 text-xs font-medium transition-colors ${
+                          followingThis
+                            ? "bg-indigo-600 text-white"
+                            : "text-indigo-700 hover:bg-indigo-500/10 dark:text-indigo-300"
+                        }`}
+                      >
+                        {followingThis ? "Stai seguendo" : "Segui"}
+                      </button>
+                    </li>
+                  );
+                })}
               </ul>
+              {c.peers.length > 0 && (
+                <div className="mt-1 flex flex-col gap-1">
+                  <Switch checked={c.leading} onChange={wb.setLeading} label="Fatti seguire da tutti" />
+                  <p className={`text-xs ${subtle}`}>
+                    Chi partecipa vede quello che vedi tu: pagina, zoom e spostamenti. Può sempre smettere spostando la vista.
+                  </p>
+                </div>
+              )}
               {c.peers.length === 0 && !answerOut && (
                 <p className={`text-xs ${subtle}`}>
                   {c.relayState === "on" || c.relayState === "connecting"

@@ -1,4 +1,4 @@
-import { parseSaved } from "./collab/validate";
+import { GRIDS, parsePages, parseSaved } from "./collab/validate";
 import { MAX_ZOOM, MIN_ZOOM } from "./types";
 import type { BoardMeta, Camera, El, GridMode, PersistedBoard, Point } from "./types";
 
@@ -97,8 +97,7 @@ export function parseBoard(text: string): PersistedBoard | null {
     }
   }
 
-  const grid: GridMode | undefined =
-    data.grid === "none" || data.grid === "dots" || data.grid === "lines" ? data.grid : undefined;
+  const grid: GridMode | undefined = GRIDS.includes(data.grid as GridMode) ? (data.grid as GridMode) : undefined;
 
   return {
     version: 1,
@@ -113,6 +112,7 @@ export function parseBoard(text: string): PersistedBoard | null {
     recentColors: Array.isArray(data.recentColors)
       ? data.recentColors.filter((c): c is string => typeof c === "string" && HEX.test(c)).slice(0, 8)
       : undefined,
+    pages: parsePages(data.pages) ?? undefined,
     collab: parseSaved(data.collab),
   };
 }

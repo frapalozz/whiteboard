@@ -61,6 +61,12 @@ export function parseMsg(raw: unknown): Msg | null {
     }
     case "dend":
       return isStr(raw.id, 100) ? { t: "dend", id: raw.id } : null;
+    case "vw":
+      if (!isNum(raw.x) || !isNum(raw.y) || !isNum(raw.w) || !isNum(raw.h)) return null;
+      if (raw.w <= 0 || raw.h <= 0 || raw.w > 1e7 || raw.h > 1e7) return null;
+      return { t: "vw", x: raw.x, y: raw.y, w: raw.w, h: raw.h };
+    case "lead":
+      return typeof raw.on === "boolean" ? { t: "lead", on: raw.on } : null;
     case "bye":
       return { t: "bye" };
     default:

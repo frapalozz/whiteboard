@@ -14,7 +14,7 @@ npm run typecheck
 - **Strumenti**: selezione, mano, penna (tratti lisci), gomma a oggetti, linea, freccia, rettangolo, ellisse, testo multilinea.
 - **Selezione**: click, Shift+click, rettangolo di selezione, spostamento, ridimensionamento dagli angoli (Shift = proporzioni),
   frecce per spostare (Shift = ×10), duplica, copia/taglia/incolla, primo piano / sullo sfondo, elimina.
-- **Stile**: colore (palette, recenti, selettore libero), spessore, riempimento forme, sfondo e griglia (punti/righe). Con una selezione attiva le modifiche si applicano agli elementi selezionati.
+- **Stile**: colore (palette, recenti, selettore libero), spessore, riempimento forme, sfondo e motivo (punti, griglia, quadretti, righe con margine). Con una selezione attiva le modifiche si applicano agli elementi selezionati.
 - **Camera**: pan con rotella/trackpad, Spazio+trascina, tasto destro o centrale; zoom con Ctrl+rotella/pinch ancorato al cursore; pinch e pan a due dita su touch; "adatta al contenuto".
 - **Undo/redo** illimitati nella pratica (200 passi), anche per gomma, import e svuota.
 - **Libreria di lavagne** salvata nel browser (localStorage): crea, apri, rinomina, duplica ed elimina lavagne dal
@@ -33,6 +33,15 @@ npm run typecheck
   automatico); se il telefono mette il browser in background o la pagina si ricarica, la connessione si riforma da sola.
   Resta disponibile l'invito manuale (link + codice di risposta) senza alcun server.
   Cursori con nome, tratti visibili mentre vengono disegnati, undo/redo che annulla solo le *tue* azioni. Vedi sotto.
+- **Modalità lezione**: dal menu "Sfondo, griglia e pagine" si attivano le *pagine in sequenza*: fogli 16:10 uno sotto
+  l'altro, con lo sfondo a quadretti o a righe come un quaderno. Una barra in basso (in alto sul telefono) sfoglia le pagine
+  (‹ ›, Pagina su/giù, o le frecce quando non c'è niente di selezionato), ne aggiunge una in fondo o elimina quella corrente
+  con il suo contenuto (le successive salgono; Ctrl+Z la ripristina). Il numero di pagine viaggia nel file `.json`, nel link
+  di condivisione e nella collaborazione.
+- **Segui l'insegnante**: in collaborazione, "Fatti seguire da tutti" fa vedere a ogni partecipante quello che vedi tu
+  (pagina, zoom, spostamenti); chi entra a lezione iniziata ti segue subito. Si può anche seguire una persona sola dal
+  pulsante "Segui" accanto al suo nome. Chi segue può scrivere sulla pagina; appena sposta la vista da solo smette di
+  seguire, e la barra della lezione mostra chi stai seguendo con un pulsante per smettere.
 - **Interfaccia**: pannelli "vetro" chiari o scuri secondo il tema del sistema, strumenti raggruppati con tooltip e
   scorciatoie, pannello proprietà contestuale, notifiche, layout adattato a mobile e touch.
 - Supporto mouse, touch e penna (Pointer Events), schermi HiDPI, ridimensionamento finestra.
@@ -49,6 +58,7 @@ npm run typecheck
 | R / O | Rettangolo / Ellisse | 1 | Adatta al contenuto |
 | T | Testo (doppio click per modificare) | Ctrl+0 / Ctrl+± | Zoom 100% / Zoom |
 | Shift (mentre disegni) | Angoli a 15° / quadrato | Esc | Deseleziona / chiudi testo |
+| Pag ↓ / Pag ↑ | Pagina successiva / precedente | ← → ↑ ↓ (senza selezione) | Cambia pagina (con le pagine attive) |
 
 ## Architettura
 
@@ -62,7 +72,7 @@ src/engine/
   whiteboard.ts  classe Whiteboard: stato, input, strumenti, history, persistenza, export
 src/hooks/useWhiteboard.ts
 src/components/  WhiteBoard (composizione), Canvas, TextEditor, Toolbar, PropertiesPanel, ViewMenu, FileMenu,
-                 BoardChip, BoardsDrawer, Toast, ui (design system)
+                 LessonBar (pagine e "segui"), BoardChip, BoardsDrawer, Toast, ui (design system)
 ```
 
 ### Collaborazione P2P
@@ -101,6 +111,13 @@ e ogni peer inoltra agli altri solo ciò che ha cambiato il proprio stato (gossi
 una chiave frazionaria per elemento. Lo storico di undo/redo è ri-agganciato (`rebase`) al lavoro altrui: annulli le tue azioni, non quelle degli altri.
 Durante un trascinamento locale gli aggiornamenti remoti aspettano la fine del gesto.
 
+**Pagine e "segui".** Le pagine non sono elementi: sono un layout fisso (fogli di 1600×1000 unità impilati da (0, 0)) più un
+numero, sincronizzato come sfondo e griglia (registro "ultima scrittura vince"). Le pagine mostrate sono il massimo tra quel numero
+e quelle occupate dal contenuto, così il lavoro di un altro partecipante (o un annulla) non finisce mai fuori dai fogli. "Segui"
+usa due messaggi di presenza, effimeri come i cursori: `vw` (l'area visibile in coordinate mondo, a ogni spostamento) e `lead`
+("fatti seguire"). Chi segue adatta quell'area al proprio schermo; a metà di un tratto la vista aspetta la fine del gesto. Le versioni
+precedenti dell'app ignorano questi messaggi e il numero di pagine, quindi una stanza mista continua a funzionare.
+
 **Local-first.** Ogni partecipante tiene la propria copia in localStorage (con i metadati di sincronizzazione), anche offline. Se ricarichi
 la pagina la lavagna resta e, con il collegamento automatico, rientra nella stanza da sola (con l'invito manuale serve un nuovo
 invito di chi è ancora nella stanza). Chi apre un invito ottiene una *nuova* lavagna nella libreria, a meno che ne abbia già una
@@ -120,7 +137,7 @@ di quella stanza: in quel caso viene riaperta quella, senza doppioni. "Esci dall
 | Chiave localStorage | Contenuto |
 |---|---|
 | `whiteboard:index` | elenco lavagne (id, nome, date, anteprima) e lavagna corrente |
-| `whiteboard:board:<id>` | una lavagna: elementi, camera, sfondo, griglia (e metadati di sincronizzazione se collaborativa) |
+| `whiteboard:board:<id>` | una lavagna: elementi, camera, sfondo, griglia, numero di pagine (e metadati di sincronizzazione se collaborativa) |
 | `whiteboard:collab` | nome visualizzato e preferenze STUN e collegamento automatico |
 
 localStorage ha un limite di pochi MB per sito: se si esaurisce, l'app continua a funzionare in memoria e lo segnala

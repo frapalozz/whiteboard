@@ -30,7 +30,11 @@ export type ToolId =
   | "ellipse"
   | "text";
 
-export type GridMode = "none" | "dots" | "lines";
+/**
+ * Motivo dello sfondo. "lines" è la griglia; "squares" (quadretti) e "ruled" (righe) imitano i
+ * quaderni di scuola e sono ancorati al foglio, non allo zoom.
+ */
+export type GridMode = "none" | "dots" | "lines" | "squares" | "ruled";
 
 interface BaseEl {
   id: string;
@@ -111,6 +115,10 @@ export interface UIState {
   boards: BoardMeta[];
   saveState: SaveState;
   lastSaved: number;
+  /* modalità lezione: pagine in sequenza (pageCount 0 = lavagna infinita) */
+  pageCount: number;
+  /** Pagina mostrata (indice da 0), calcolata dal centro della vista. */
+  page: number;
   /* collaborazione P2P */
   collab: CollabUI;
 }
@@ -137,8 +145,23 @@ export interface PersistedBoard {
   width?: number;
   fill?: boolean;
   recentColors?: string[];
+  /** Numero di pagine in modalità lezione (assente o 0 = lavagna infinita). */
+  pages?: number;
   /** Metadati di sincronizzazione, presenti solo se la lavagna è (o era) collaborativa. */
   collab?: CollabSaved;
+}
+
+/* ---- pagine (modalità lezione) ---- */
+
+/** Pagina 16:10, come uno schermo o una LIM. Le pagine sono impilate in verticale a partire da (0, 0). */
+export const PAGE_W = 1600;
+export const PAGE_H = 1000;
+export const PAGE_GAP = 120;
+export const PAGE_STRIDE = PAGE_H + PAGE_GAP;
+export const MAX_PAGES = 500;
+
+export function pageRect(i: number): Rect {
+  return { x: 0, y: i * PAGE_STRIDE, w: PAGE_W, h: PAGE_H };
 }
 
 export const MIN_ZOOM = 0.05;

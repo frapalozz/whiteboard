@@ -1,4 +1,4 @@
-import type { El, GridMode, Point } from "../types";
+import type { El, GridMode, Point, Rect } from "../types";
 import { CollabDoc, MAX_POINTS, type Props } from "./doc";
 import { cleanName, colorFor, randomId } from "./protocol";
 import { CollabSession, webrtcSupported } from "./session";
@@ -11,11 +11,14 @@ export interface CollabHost {
   getElements(): El[];
   getProps(): Props;
   getBoardName(): string;
-  getPresence(): { cursor: Point | null; draft: El | null };
+  /** `view`: area visibile in coordinate mondo (la segue chi ti segue). */
+  getPresence(): { cursor: Point | null; draft: El | null; view: Rect | null };
   /** true durante un trascinamento/ridimensionamento locale: gli aggiornamenti remoti si rimandano. */
   isBusy(): boolean;
   /** Applica lo stato remoto al documento locale (senza history e senza rimandarlo in rete). */
-  setRemoteState(next: { elements?: El[]; bgColor?: string; grid?: GridMode; first?: boolean }): void;
+  setRemoteState(next: { elements?: El[]; bgColor?: string; grid?: GridMode; pages?: number; first?: boolean }): void;
+  /** Mostra l'area `view` (coordinate mondo) di chi si sta seguendo. */
+  followView(view: Rect): void;
   invalidate(): void;
   emit(): void;
   persist(): void;
@@ -27,6 +30,10 @@ export interface RemoteView {
   color: string;
   cursor: { x: number; y: number; t: number } | null;
   draft: El | null;
+  /** Ultima area visibile annunciata (coordinate mondo). */
+  view: Rect | null;
+  /** Chiede di essere seguito. */
+  leading: boolean;
 }
 
 type Result<T extends object = object> = ({ ok: true } & T) | { ok: false; error: string };
@@ -35,6 +42,7 @@ const PREFS_KEY = "whiteboard:collab";
 const PRESENCE_MS = 40;
 const BATCH_MAX = 400;
 const r2 = (v: number) => Math.round(v * 100) / 100;
+const roundRect = (r: Rect): Rect => ({ x: r2(r.x), y: r2(r.y), w: r2(r.w), h: r2(r.h) });
 
 function chunkBatch(b: Batch): Batch[] {
   if (b.e.length <= BATCH_MAX) return [b];
@@ -59,6 +67,11 @@ export class Collab {
   private lastCursor = "";
   private draftSent: { id: string; n: number } | null = null;
   private draftKey = "";
+  private lastView = "";
+  /** Stai chiedendo a tutti di seguirti. */
+  private leading = false;
+  /** Sito del partecipante che stai seguendo. */
+  private following: string | null = null;
 
   constructor(private host: CollabHost) {}
 
@@ -118,6 +131,9 @@ export class Collab {
     this.lastCursor = "";
     this.draftSent = null;
     this.draftKey = "";
+    this.lastView = "";
+    this.leading = false;
+    this.following = null;
     if (this.presenceTimer) clearTimeout(this.presenceTimer);
     this.presenceTimer = null;
   }
@@ -269,13 +285,18 @@ export class Collab {
       { room: doc.room, site: doc.site, name: this.effectiveName(), stun: this.stun, relay: this.relay && relaySupported() },
       {
         onPeerOpen: (peer) => {
-          this.remotes.set(peer.site, { site: peer.site, name: peer.name, color: peer.color, cursor: null, draft: null });
+          this.remotes.set(peer.site, { site: peer.site, name: peer.name, color: peer.color, cursor: null, draft: null, view: null, leading: false });
           // ognuno manda il proprio stato completo: il merge è idempotente
           for (const b of doc.snapshot()) this.session?.sendTo(peer.site, { t: "ops", b });
+          // chi arriva a lezione iniziata sa subito chi seguire e cosa sta guardando
+          const view = this.host.getPresence().view;
+          if (view) this.session?.sendTo(peer.site, { t: "vw", ...roundRect(view) });
+          if (this.leading) this.session?.sendTo(peer.site, { t: "lead", on: true });
           this.refreshUI();
         },
         onPeerClose: (site) => {
           this.remotes.delete(site);
+          if (this.following === site) this.following = null;
           this.host.invalidate();
           this.refreshUI();
         },
@@ -293,7 +314,18 @@ export class Collab {
   localChanged(): void {
     const doc = this.doc;
     if (!doc) return;
-    const b = doc.local(this.host.getElements(), this.host.getProps(), this.pending.size ? this.pending : undefined);
+    let props = this.host.getProps();
+    // proprietà remote non ancora applicate al motore (gesture in corso): valgono quelle del documento,
+    // altrimenti i valori vecchi del motore sovrascriverebbero quelli appena arrivati
+    if (this.pendingProps) {
+      const cur = doc.currentProps();
+      props = {
+        bgColor: cur.bgColor ?? props.bgColor,
+        grid: cur.grid ?? props.grid,
+        pages: cur.pages ?? props.pages,
+      };
+    }
+    const b = doc.local(this.host.getElements(), props, this.pending.size ? this.pending : undefined);
     if (b && this.session) for (const part of chunkBatch(b)) this.session.send({ t: "ops", b: part });
   }
 
@@ -313,16 +345,18 @@ export class Collab {
     }
     let bgColor: string | undefined;
     let grid: GridMode | undefined;
+    let pages: number | undefined;
     if (this.pendingProps) {
       const p = doc.currentProps();
       bgColor = p.bgColor;
       grid = p.grid;
+      pages = p.pages;
     }
     this.pending = new Set();
     this.pendingProps = false;
     const first = !this.synced && doc.mode === "guest" && !!elements?.length;
     if (elements?.length || this.synced === false) this.synced = true;
-    this.host.setRemoteState({ elements, bgColor, grid, first });
+    this.host.setRemoteState({ elements, bgColor, grid, pages, first });
   }
 
   private onMessage(msg: Msg, from: string): void {
@@ -372,7 +406,56 @@ export class Collab {
           this.host.invalidate();
         }
         return;
+      case "vw":
+        if (!rv) return;
+        rv.view = { x: msg.x, y: msg.y, w: msg.w, h: msg.h };
+        if (this.following === from) this.host.followView(rv.view);
+        return;
+      case "lead":
+        if (!rv || rv.leading === msg.on) return;
+        rv.leading = msg.on;
+        if (msg.on && !this.leading) this.follow(from);
+        else if (!msg.on && this.following === from) this.following = null;
+        this.refreshUI();
+        return;
     }
+  }
+
+  /* ---------------------------------------------------------------------
+   * Segui la vista di un altro partecipante (modalità lezione)
+   * ------------------------------------------------------------------- */
+
+  /** Inizia a seguire la vista di `site` (null: smetti). */
+  follow(site: string | null): void {
+    const rv = site ? this.remotes.get(site) : undefined;
+    this.following = rv ? rv.site : null;
+    if (rv?.view) this.host.followView(rv.view);
+    this.refreshUI();
+  }
+
+  /** L'utente ha mosso la vista da solo: smette di seguire. */
+  unfollow(): void {
+    if (!this.following) return;
+    this.following = null;
+    this.refreshUI();
+  }
+
+  get isFollowing(): boolean {
+    return this.following !== null;
+  }
+
+  /** Chiede a tutti i partecipanti di seguire la tua vista (o smette di chiederlo). */
+  setLeading(on: boolean): void {
+    if (!this.doc || this.leading === on) return;
+    this.leading = on;
+    if (on) {
+      this.following = null;
+      // la vista va mandata subito, non al prossimo movimento
+      this.lastView = "";
+      this.ping();
+    }
+    this.session?.send({ t: "lead", on });
+    this.refreshUI();
   }
 
   /* ---------------------------------------------------------------------
@@ -395,7 +478,16 @@ export class Collab {
   private flushPresence(): void {
     const s = this.session;
     if (!s) return;
-    const { cursor, draft } = this.host.getPresence();
+    const { cursor, draft, view } = this.host.getPresence();
+
+    if (view) {
+      const r = roundRect(view);
+      const vk = `${r.x},${r.y},${r.w},${r.h}`;
+      if (vk !== this.lastView) {
+        this.lastView = vk;
+        s.send({ t: "vw", ...r });
+      }
+    }
 
     const key = cursor ? `${cursor.x.toFixed(1)},${cursor.y.toFixed(1)}` : "";
     if (key !== this.lastCursor) {
@@ -445,6 +537,9 @@ export class Collab {
       relayState: this.session?.relayState ?? "off",
       site: d?.site ?? "",
       color: d ? colorFor(d.site) : OFF_UI.color,
+      leading: this.leading,
+      following: this.following,
+      leaders: [...this.remotes.values()].filter((r) => r.leading).map((r) => r.site),
     };
     const p = this.ui;
     const same =
@@ -455,6 +550,9 @@ export class Collab {
       p.relay === next.relay &&
       p.relayState === next.relayState &&
       p.site === next.site &&
+      p.leading === next.leading &&
+      p.following === next.following &&
+      p.leaders.join() === next.leaders.join() &&
       p.peers.length === next.peers.length &&
       p.peers.every((x, i) => x.site === next.peers[i].site && x.name === next.peers[i].name);
     if (same) return;

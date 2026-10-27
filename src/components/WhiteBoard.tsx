@@ -10,6 +10,7 @@ import BoardsDrawer from "./BoardsDrawer";
 import Canvas from "./Canvas";
 import CollabDialog from "./CollabDialog";
 import FileMenu from "./FileMenu";
+import LessonBar from "./LessonBar";
 import PropertiesPanel from "./PropertiesPanel";
 import Toast, { type ToastMsg } from "./Toast";
 import Toolbar from "./Toolbar";
@@ -184,6 +185,11 @@ export default function WhiteBoard() {
           </div>
         )}
 
+        {/* Modalità lezione: pagine e "segui" (sotto la lavagna su schermi larghi, in alto a sinistra sul telefono) */}
+        <div className="absolute left-2 top-[3.75rem] md:bottom-[4.5rem] md:top-auto lg:bottom-3">
+          <LessonBar wb={wb} ui={ui} />
+        </div>
+
         {/* Zoom */}
         <div className={`${panel} absolute bottom-[4.5rem] right-2 flex items-center gap-0.5 p-1.5 max-md:hidden lg:bottom-3`}>
           <Btn label="Riduci" shortcut="Ctrl+−" tip="top" onClick={wb.zoomOut}>
@@ -214,8 +220,12 @@ export default function WhiteBoard() {
             style={{ color: dark ? "rgba(255,255,255,0.55)" : "rgba(0,0,0,0.5)" }}
           >
             <div>
-              <p className="text-2xl font-semibold tracking-tight">Una lavagna senza confini</p>
-              <p className="mt-1 text-sm">Inizia a disegnare: viene salvata da sola.</p>
+              <p className="text-2xl font-semibold tracking-tight">
+                {ui.pageCount > 0 ? "La prima pagina è pronta" : "Una lavagna senza confini"}
+              </p>
+              <p className="mt-1 text-sm">
+                {ui.pageCount > 0 ? "Scrivi sul foglio. Cambi pagina con ‹ › o aggiungine una nuova." : "Inizia a disegnare: viene salvata da sola."}
+              </p>
             </div>
             {([["hidden [@media(hover:hover)]:flex", TIPS_DESKTOP], ["hidden [@media(hover:none)]:flex", TIPS_TOUCH]] as const).map(([cls, tips]) => (
               <ul key={cls} className={`${cls} flex-wrap justify-center gap-2 text-xs`}>

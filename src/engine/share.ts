@@ -1,5 +1,6 @@
+import { GRIDS } from "./collab/validate";
 import { parseBoard } from "./storage";
-import type { El, GridMode, PersistedBoard } from "./types";
+import type { El, PersistedBoard } from "./types";
 
 /**
  * Condivisione tramite URL.
@@ -22,7 +23,6 @@ export const SHARE_HARD_LIMIT = 1_500_000;
 /** Protezione da "zip bomb": dimensione massima del JSON decompresso. */
 const MAX_INFLATED = 40 * 1024 * 1024;
 
-const GRIDS: GridMode[] = ["none", "dots", "lines"];
 const TYPES = ["stroke", "line", "arrow", "rect", "ellipse", "text"] as const;
 
 const q = (v: number) => Math.round(v * 100);
@@ -151,6 +151,7 @@ export async function encodeBoard(board: PersistedBoard): Promise<string> {
     n: board.name ?? "",
     b: board.bgColor ? hex(board.bgColor) : undefined,
     g: board.grid ? GRIDS.indexOf(board.grid) : undefined,
+    p: board.pages || undefined,
     c: board.camera ? [q(board.camera.x), q(board.camera.y), Math.round(board.camera.zoom * 1000) / 1000] : undefined,
     e: board.elements.map(packElement),
   };
@@ -190,6 +191,7 @@ export async function decodeBoard(value: string): Promise<PersistedBoard | null>
         name: typeof d.n === "string" ? d.n : undefined,
         bgColor: typeof d.b === "string" ? `#${d.b}` : undefined,
         grid: typeof d.g === "number" ? GRIDS[d.g] : undefined,
+        pages: d.p,
         camera: cam ? { x: uq(cam[0]), y: uq(cam[1]), zoom: cam[2] } : undefined,
         elements: d.e.map(unpackElement).filter((e) => e !== null),
       }),
