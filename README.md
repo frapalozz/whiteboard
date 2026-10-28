@@ -6,6 +6,7 @@ la UI in `src/components` è un guscio sottile che legge lo stato tramite `useSy
 ```bash
 npm install
 npm run dev        # http://localhost:3000
+npm run lint
 npm run typecheck
 ```
 
