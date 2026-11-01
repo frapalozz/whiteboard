@@ -28,7 +28,20 @@ export type ToolId =
   | "arrow"
   | "rect"
   | "ellipse"
+  | "diamond"
+  | "terminal"
+  | "data"
   | "text";
+
+/**
+ * Forme "scatola": rettangolo (processo), ellisse, rombo (decisione), inizio/fine (rettangolo con
+ * i lati arrotondati), dati (parallelogramma, input/output). Possono contenere un'etichetta e le
+ * frecce vi si agganciano.
+ */
+export const BOX_TYPES = ["rect", "ellipse", "diamond", "terminal", "data"] as const;
+export type BoxType = (typeof BOX_TYPES)[number];
+const BOX_SET = new Set<string>(BOX_TYPES);
+export const isBoxType = (t: string): t is BoxType => BOX_SET.has(t);
 
 /**
  * Motivo dello sfondo. "lines" è la griglia; "squares" (quadretti) e "ruled" (righe) imitano i
@@ -52,15 +65,22 @@ export interface LineEl extends BaseEl {
   type: "line" | "arrow";
   a: Point;
   b: Point;
+  /** Id della forma a cui è agganciato l'estremo `a` / `b` (diagrammi di flusso). */
+  from?: string;
+  to?: string;
+  /** Etichetta scritta a metà del collegamento (es. "Sì" / "No"). */
+  label?: string;
 }
 
 export interface BoxEl extends BaseEl {
-  type: "rect" | "ellipse";
+  type: BoxType;
   x: number;
   y: number;
   w: number;
   h: number;
   fill: boolean;
+  /** Testo centrato dentro la forma. */
+  label?: string;
 }
 
 export interface TextEl extends BaseEl {
@@ -78,6 +98,9 @@ export interface TextEl extends BaseEl {
  */
 export type El = StrokeEl | LineEl | BoxEl | TextEl;
 
+export const isBox = (el: El): el is BoxEl => isBoxType(el.type);
+export const isLine = (el: El): el is LineEl => el.type === "line" || el.type === "arrow";
+
 export interface TextEdit {
   /** Identifica la sessione di editing: i commit di sessioni vecchie vengono ignorati. */
   session: number;
@@ -88,6 +111,11 @@ export interface TextEdit {
   text: string;
   fontSize: number;
   color: string;
+  /**
+   * Presente quando si scrive l'etichetta di una forma o di una freccia (`id`): il testo va a capo e
+   * resta centrato nell'area `box` (coordinate mondo).
+   */
+  label?: { box: Rect };
 }
 
 /** Stato osservabile dalla UI React (immutabile, sostituito a ogni cambiamento). */
@@ -104,6 +132,10 @@ export interface UIState {
   selectionCount: number;
   /** true se lo strumento corrente o la selezione contengono forme riempibili. */
   showFill: boolean;
+  /** Ultima forma usata: è quella che attiva il pulsante "Forme". */
+  lastShape: BoxType;
+  /** Tipo di forma comune alla selezione (null se non è fatta solo di forme dello stesso tipo). */
+  selShape: BoxType | null;
   hasContent: boolean;
   recentColors: string[];
   editing: TextEdit | null;

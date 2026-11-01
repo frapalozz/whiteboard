@@ -12,7 +12,16 @@ npm run typecheck
 
 ## Funzioni
 
-- **Strumenti**: selezione, mano, penna (tratti lisci), gomma a oggetti, linea, freccia, rettangolo, ellisse, testo multilinea.
+- **Strumenti**: selezione, mano, penna (tratti lisci), gomma a oggetti, linea, freccia, forme, testo multilinea.
+- **Diagrammi di flusso**: il pulsante "Forme" offre inizio/fine, azione (rettangolo), decisione (rombo), dati
+  (input/output, parallelogramma) ed ellisse. Un clic piazza una forma già pronta per scriverci dentro; trascinando la si
+  disegna della misura voluta. Il testo nelle forme è centrato e va a capo, e la forma si allarga se non ci sta
+  (doppio clic, Invio sulla forma selezionata o lo strumento Testo per scriverci). Le frecce (e le linee) che partono o
+  arrivano dentro una forma vi restano agganciate: spostando o ridimensionando le forme, le frecce le seguono. Selezionando
+  una freccia, i pallini agli estremi si trascinano per staccarla o agganciarla a un'altra forma (pieno = agganciato), e un
+  doppio clic ci scrive sopra un'etichetta ("Sì", "No"). Con una forma selezionata, i "+" sui lati liberi creano la forma
+  successiva già collegata. Il pannello cambia il tipo delle forme selezionate senza perdere testo e frecce. Duplicando o
+  copiando forme e frecce insieme, le copie restano collegate tra loro.
 - **Selezione**: click, Shift+click, rettangolo di selezione, spostamento, ridimensionamento dagli angoli (Shift = proporzioni),
   frecce per spostare (Shift = ×10), duplica, copia/taglia/incolla, primo piano / sullo sfondo, elimina.
 - **Stile**: colore (palette, recenti, selettore libero), spessore, riempimento forme, sfondo e motivo (punti, griglia, quadretti, righe con margine). Con una selezione attiva le modifiche si applicano agli elementi selezionati.
@@ -56,8 +65,9 @@ npm run typecheck
 | P o B | Penna | Ctrl+C / X / V / D | Copia / Taglia / Incolla / Duplica |
 | E | Gomma | Canc | Elimina selezione |
 | L / A | Linea / Freccia | ] / [ | Primo piano / Sfondo |
-| R / O | Rettangolo / Ellisse | 1 | Adatta al contenuto |
+| R / O / D | Forme: rettangolo / ellisse / decisione | 1 | Adatta al contenuto |
 | T | Testo (doppio click per modificare) | Ctrl+0 / Ctrl+± | Zoom 100% / Zoom |
+| Invio | Scrivi nella forma, freccia o testo selezionato | Maiusc+Invio (scrivendo in una forma) | A capo |
 | Shift (mentre disegni) | Angoli a 15° / quadrato | Esc | Deseleziona / chiudi testo |
 | Pag ↓ / Pag ↑ | Pagina successiva / precedente | ← → ↑ ↓ (senza selezione) | Cambia pagina (con le pagine attive) |
 
@@ -66,7 +76,8 @@ npm run typecheck
 ```
 src/engine/
   types.ts       tipi (Camera, elementi, stato UI)
-  geometry.ts    bounds, hit-test, trasformazioni, semplificazione tratti (RDP)
+  geometry.ts    bounds, hit-test, trasformazioni, semplificazione tratti (RDP), forme ed etichette
+  flow.ts        frecce agganciate alle forme (ancoraggio sul contorno, ricalcolo, copia)
   render.ts      disegno di elementi e griglia (usato anche dall'export), LOD per lo zoom-out
   storage.ts     validazione/parsing JSON, download
   share.ts       codifica/decodifica della lavagna nell'URL (formato compatto + deflate + base64url)
@@ -111,6 +122,13 @@ e diventa un'operazione. Il merge è commutativo e idempotente, quindi i peer co
 e ogni peer inoltra agli altri solo ciò che ha cambiato il proprio stato (gossip senza cicli). Le cancellazioni sono lapidi, l'ordine z è
 una chiave frazionaria per elemento. Lo storico di undo/redo è ri-agganciato (`rebase`) al lavoro altrui: annulli le tue azioni, non quelle degli altri.
 Durante un trascinamento locale gli aggiornamenti remoti aspettano la fine del gesto.
+
+**Frecce agganciate.** Una freccia ricorda l'id delle forme ai suoi capi (`from`/`to`); i suoi punti restano salvati come
+normali coordinate (export, link e versioni precedenti la disegnano comunque) ma vengono ricalcolati dopo ogni modifica,
+locale o remota: ogni capo agganciato sta sul contorno della sua forma, sulla retta verso l'altro capo. Il calcolo è
+deterministico e non tocca gli oggetti che non cambiano, quindi se due persone spostano i due capi della stessa freccia
+entrambe ricalcolano lo stesso risultato e la sincronizzazione si ferma al primo scambio. Nel link condiviso gli agganci
+viaggiano come posizioni nell'elenco degli elementi (gli id non ci sono).
 
 **Pagine e "segui".** Le pagine non sono elementi: sono un layout fisso (fogli di 1600×1000 unità impilati da (0, 0)) più un
 numero, sincronizzato come sfondo e griglia (registro "ultima scrittura vince"). Le pagine mostrate sono il massimo tra quel numero

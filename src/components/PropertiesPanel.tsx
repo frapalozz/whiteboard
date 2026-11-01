@@ -3,21 +3,57 @@
 import { useState } from "react";
 import { HexColorPicker } from "react-colorful";
 import { MAX_WIDTH, MIN_WIDTH, PALETTE } from "@/engine/constants";
-import type { ToolId, UIState } from "@/engine/types";
+import { isBoxType, type BoxType, type ToolId, type UIState } from "@/engine/types";
 import type { Whiteboard } from "@/engine/whiteboard";
 import { icons } from "./icons";
 import { panel, Section, Swatch, Switch, subtle } from "./ui";
 
-const DRAW_TOOLS: ToolId[] = ["pen", "eraser", "line", "arrow", "rect", "ellipse", "text"];
+const DRAW_TOOLS: ToolId[] = ["pen", "eraser", "line", "arrow", "rect", "ellipse", "diamond", "terminal", "data", "text"];
 const TITLES: Partial<Record<ToolId, string>> = {
   pen: "Penna",
   eraser: "Gomma",
   line: "Linea",
   arrow: "Freccia",
-  rect: "Rettangolo",
-  ellipse: "Ellisse",
+  rect: "Forme",
+  ellipse: "Forme",
+  diamond: "Forme",
+  terminal: "Forme",
+  data: "Forme",
   text: "Testo",
 };
+/** Le forme, con il loro significato nei diagrammi di flusso. */
+const SHAPE_INFO: Record<BoxType, { label: string; icon: keyof typeof icons }> = {
+  terminal: { label: "Inizio / fine", icon: "terminal" },
+  rect: { label: "Azione (processo)", icon: "rect" },
+  diamond: { label: "Decisione (sì / no)", icon: "diamond" },
+  data: { label: "Dati (input / output)", icon: "data" },
+  ellipse: { label: "Ellisse", icon: "ellipse" },
+};
+const SHAPE_ORDER: BoxType[] = ["terminal", "rect", "diamond", "data", "ellipse"];
+
+function ShapePicker({ value, onPick }: { value: BoxType | null; onPick: (t: BoxType) => void }) {
+  return (
+    <div role="radiogroup" aria-label="Forma" className="grid grid-cols-5 gap-1">
+      {SHAPE_ORDER.map((t) => (
+        <button
+          key={t}
+          type="button"
+          role="radio"
+          aria-checked={value === t}
+          aria-label={SHAPE_INFO[t].label}
+          title={SHAPE_INFO[t].label}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => onPick(t)}
+          className={`grid h-9 place-items-center rounded-xl transition-colors ${
+            value === t ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/30" : "hover:bg-black/5 dark:hover:bg-white/10"
+          }`}
+        >
+          {icons[SHAPE_INFO[t].icon]}
+        </button>
+      ))}
+    </div>
+  );
+}
 const PRESETS = [2, 4, 8, 16];
 
 /** Pannello proprietà: compare solo quando ha qualcosa da modificare. */
@@ -31,6 +67,14 @@ export default function PropertiesPanel({ wb, ui, className = "" }: { wb: Whiteb
   const sizeLabel = isEraser ? "Dimensione gomma" : ui.tool === "text" ? "Dimensione testo" : "Spessore";
   const title = hasSel ? `Selezione · ${ui.selectionCount}` : (TITLES[ui.tool] ?? "");
   const customActive = !PALETTE.includes(ui.color) && !ui.recentColors.includes(ui.color);
+  const shapeTool = !hasSel && isBoxType(ui.tool);
+  const showShapes = shapeTool || (hasSel && ui.showFill);
+  const shapeValue = hasSel ? ui.selShape : isBoxType(ui.tool) ? ui.tool : null;
+  const hint =
+    hasSel ? null
+    : shapeTool ? "Clic: forma pronta per scriverci dentro. Trascina: dimensione a piacere."
+    : ui.tool === "arrow" || ui.tool === "line" ? "Parti da una forma e arriva su un'altra: il collegamento resta attaccato."
+    : null;
 
   return (
     <div className={`${panel} animate-pop-in flex w-full flex-col gap-4 p-3.5 max-md:gap-0 md:w-60 ${className}`}>
@@ -47,6 +91,13 @@ export default function PropertiesPanel({ wb, ui, className = "" }: { wb: Whiteb
         <span className="flex-1">{title}</span>
         <span className={`transition-transform md:hidden ${expanded ? "rotate-180" : ""}`}>{icons.chevron}</span>
       </button>
+      {showShapes && (
+        <div className="flex flex-col gap-1.5 max-md:mt-3">
+          <ShapePicker value={shapeValue} onPick={(t) => (hasSel ? wb.setShape(t) : wb.setTool(t))} />
+          <p className={`text-xs ${subtle}`}>{shapeValue ? SHAPE_INFO[shapeValue].label : "Forme diverse"}</p>
+        </div>
+      )}
+      {hint && <p className={`text-xs ${subtle} max-md:hidden`}>{hint}</p>}
       <div className={`${expanded ? "flex" : "hidden"} flex-col gap-4 max-md:mt-3 md:flex`}>
 
       {!isEraser && (
