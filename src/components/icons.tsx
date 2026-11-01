@@ -208,6 +208,21 @@ export const icons = {
       <path d="m6 9 6 6 6-6" />
     </Svg>
   ),
+  diamond: (
+    <Svg>
+      <path d="M12 3 21 12 12 21 3 12z" />
+    </Svg>
+  ),
+  terminal: (
+    <Svg>
+      <rect x="2.5" y="7" width="19" height="10" rx="5" />
+    </Svg>
+  ),
+  data: (
+    <Svg>
+      <path d="M7 6h14l-4 12H3z" />
+    </Svg>
+  ),
   prev: (
     <Svg>
       <path d="m15 18-6-6 6-6" />

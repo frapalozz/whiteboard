@@ -1,11 +1,16 @@
 import {
   arrowHeadLength,
   boundsOf,
+  boxPolygon,
   fontOf,
+  LABEL_LINE,
+  LABEL_SIZE,
+  labelLines,
   LINE_HEIGHT,
+  lineLabelRect,
   rectsIntersect,
 } from "./geometry";
-import { PAGE_GAP, PAGE_STRIDE, pageRect, type Camera, type El, type GridMode, type Point, type Rect } from "./types";
+import { isBox, PAGE_GAP, PAGE_STRIDE, pageRect, type Camera, type El, type GridMode, type Point, type Rect } from "./types";
 
 const lodCache = new WeakMap<El, { level: number; pts: Point[] }>();
 
@@ -41,7 +46,33 @@ function lodPoints(el: El, pts: Point[], zoom: number): Point[] {
  * `zoom` abilita il livello di dettaglio per gli elementi già confermati
  * (non va passato per le bozze, i cui punti cambiano mentre si disegna).
  */
-export function drawElement(ctx: CanvasRenderingContext2D, el: El, zoom = 1): void {
+export interface DrawOpts {
+  /** Colore dello sfondo: serve a staccare l'etichetta di una freccia dalla linea. */
+  bg?: string;
+  /** Non disegnare l'etichetta (la si sta scrivendo nella textarea). */
+  hideLabel?: boolean;
+}
+
+/** Riempimento leggero (20%) del percorso corrente, come per rettangoli ed ellissi. */
+function softFill(ctx: CanvasRenderingContext2D): void {
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.2;
+  ctx.fill();
+  ctx.globalAlpha = a;
+}
+
+/** Righe centrate attorno a (cx, cy). */
+function drawLabelLines(ctx: CanvasRenderingContext2D, lines: string[], cx: number, cy: number, color: string): void {
+  ctx.font = fontOf(LABEL_SIZE);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  const top = cy - ((lines.length - 1) * LABEL_LINE) / 2;
+  for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], cx, top + i * LABEL_LINE);
+  ctx.textAlign = "left";
+}
+
+export function drawElement(ctx: CanvasRenderingContext2D, el: El, zoom = 1, opts: DrawOpts = {}): void {
   ctx.strokeStyle = el.color;
   ctx.fillStyle = el.color;
   ctx.lineWidth = el.width;
@@ -90,6 +121,16 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: El, zoom = 1): vo
         ctx.lineTo(el.b.x - head * Math.cos(ang + spread), el.b.y - head * Math.sin(ang + spread));
         ctx.stroke();
       }
+      const lr = lineLabelRect(el);
+      if (lr && !opts.hideLabel) {
+        if (opts.bg) {
+          ctx.fillStyle = opts.bg;
+          ctx.beginPath();
+          ctx.roundRect(lr.x, lr.y, lr.w, lr.h, 6);
+          ctx.fill();
+        }
+        drawLabelLines(ctx, labelLines(el).lines, lr.x + lr.w / 2, lr.y + lr.h / 2, el.color);
+      }
       break;
     }
     case "rect": {
@@ -114,6 +155,25 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: El, zoom = 1): vo
       ctx.stroke();
       break;
     }
+    case "terminal": {
+      const r = Math.min(Math.abs(el.w), Math.abs(el.h)) / 2;
+      ctx.beginPath();
+      ctx.roundRect(el.x, el.y, el.w, el.h, r);
+      if (el.fill) softFill(ctx);
+      ctx.stroke();
+      break;
+    }
+    case "diamond":
+    case "data": {
+      const pts = boxPolygon(el)!;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.closePath();
+      if (el.fill) softFill(ctx);
+      ctx.stroke();
+      break;
+    }
     case "text": {
       ctx.font = fontOf(el.fontSize);
       ctx.textBaseline = "top";
@@ -124,6 +184,11 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: El, zoom = 1): vo
       }
       break;
     }
+  }
+  // etichetta dentro la forma
+  if (isBox(el) && el.label && !opts.hideLabel) {
+    const { lines } = labelLines(el);
+    drawLabelLines(ctx, lines, el.x + el.w / 2, el.y + el.h / 2, el.color);
   }
 }
 
@@ -139,12 +204,13 @@ export function drawElements(
   fade?: Set<string>,
   hideId?: string | null,
   zoom = 1,
+  extra: { bg?: string; hideLabelId?: string | null } = {},
 ): void {
   for (const el of elements) {
     if (hideId && el.id === hideId) continue;
     if (view && !rectsIntersect(boundsOf(el), view)) continue;
     ctx.globalAlpha = fade && fade.has(el.id) ? 0.25 : 1;
-    drawElement(ctx, el, zoom);
+    drawElement(ctx, el, zoom, { bg: extra.bg, hideLabel: extra.hideLabelId === el.id });
   }
   ctx.globalAlpha = 1;
 }

@@ -7,13 +7,20 @@ import {
   PALETTE,
 } from "./constants";
 import {
+  ARROW_LABEL_MAX,
   boundsOf,
+  centerOf,
   clamp,
   dist,
   fontSizeFor,
   geomBoundsOf,
+  heightForLabel,
   hitTest,
   inflate,
+  insideBox,
+  LABEL_LINE,
+  LABEL_SIZE,
+  labelArea,
   rectContains,
   rectFromPoints,
   rectsIntersect,
@@ -21,7 +28,9 @@ import {
   simplify,
   translateEl,
   unionRects,
+  wrapText,
 } from "./geometry";
+import { bindTargetAt, detachFrom, isTinyLine, remapBindings, resolveConnectors, resolveLine } from "./flow";
 import { Collab, type CollabHost } from "./collab/controller";
 import { drawElement, drawElements, drawGrid, drawPages, isDark } from "./render";
 import { buildShareUrl, SHARE_HARD_LIMIT } from "./share";
@@ -38,13 +47,15 @@ import {
   writeBoard,
   writeIndex,
 } from "./storage";
-import { MAX_PAGES, MAX_ZOOM, MIN_ZOOM, PAGE_GAP, PAGE_H, PAGE_STRIDE, PAGE_W, pageRect } from "./types";
+import { isBox, isBoxType, isLine, MAX_PAGES, MAX_ZOOM, MIN_ZOOM, PAGE_GAP, PAGE_H, PAGE_STRIDE, PAGE_W, pageRect } from "./types";
 import type {
   BoardMeta,
   BoxEl,
+  BoxType,
   Camera,
   El,
   GridMode,
+  LineEl,
   PersistedBoard,
   Point,
   SaveState,
@@ -56,6 +67,25 @@ import type {
 } from "./types";
 
 const HISTORY_LIMIT = 200;
+/** Raggio (px schermo) delle maniglie degli estremi e dei pulsanti "+" del collegamento rapido. */
+const END_HIT = 11;
+const PLUS_OFFSET = 26;
+const PLUS_HIT = 10;
+/** Distanza tra una forma e quella creata dal collegamento rapido (unità mondo). */
+const FLOW_GAP = 90;
+/** Larghezza massima a cui una forma si allarga da sola per far stare la sua etichetta. */
+const FIT_MAX_W = 320;
+/** Dimensioni delle forme piazzate con un clic. */
+const DEFAULT_SIZE: Record<BoxType, { w: number; h: number }> = {
+  rect: { w: 200, h: 100 },
+  ellipse: { w: 180, h: 110 },
+  diamond: { w: 200, h: 130 },
+  terminal: { w: 200, h: 80 },
+  data: { w: 210, h: 100 },
+};
+type Side = "top" | "right" | "bottom" | "left";
+const SIDES: Side[] = ["top", "right", "bottom", "left"];
+const SIDE_DIR: Record<Side, Point> = { top: { x: 0, y: -1 }, right: { x: 1, y: 0 }, bottom: { x: 0, y: 1 }, left: { x: -1, y: 0 } };
 const HANDLE_HIT = 9;
 const RECENT_MAX = 5;
 
@@ -66,7 +96,9 @@ const OPPOSITE: Record<Handle, Handle> = { nw: "se", se: "nw", ne: "sw", sw: "ne
 type Action =
   | { kind: "pan"; pid: number; last: Point }
   | { kind: "pen"; pid: number }
-  | { kind: "shape"; pid: number; start: Point }
+  | { kind: "shape"; pid: number; start: Point; startScreen: Point; bind: string | null }
+  /** Trascinamento di un estremo di un collegamento selezionato (per staccarlo o agganciarlo altrove). */
+  | { kind: "endpoint"; pid: number; end: "a" | "b"; id: string; origin: El[]; moved: boolean }
   | { kind: "erase"; pid: number; last: Point }
   | { kind: "move"; pid: number; start: Point; origin: El[]; moved: boolean }
   | {
@@ -128,8 +160,12 @@ export class Whiteboard {
   private tool: ToolId = "pen";
   private style = { color: DEFAULT_COLOR, width: DEFAULT_WIDTH, fill: false };
   private recentColors: string[] = [];
+  /** Ultima forma scelta (il pulsante "Forme" della barra riattiva questa). */
+  private lastShape: BoxType = "rect";
 
   /* ---- stato transitorio ---- */
+  /** Forma evidenziata a cui si aggancerà l'estremo che si sta disegnando o trascinando. */
+  private snapTarget: string | null = null;
   private selection = new Set<string>();
   private draft: El | null = null;
   private erasing = new Set<string>();
@@ -211,7 +247,7 @@ export class Whiteboard {
       if (sel.length) {
         if (sel.every((e) => e.color === sel[0].color)) color = sel[0].color;
         if (sel.every((e) => e.width === sel[0].width)) width = sel[0].width;
-        const boxes = sel.filter((e): e is BoxEl => e.type === "rect" || e.type === "ellipse");
+        const boxes = sel.filter(isBox);
         if (boxes.length) {
           hasBox = true;
           if (boxes.every((b) => b.fill === boxes[0].fill)) fill = boxes[0].fill;
@@ -220,6 +256,11 @@ export class Whiteboard {
     }
     const prev = this.snapshot as UIState | undefined;
     const editing = this.editing;
+    let selShape: BoxType | null = null;
+    if (this.selection.size) {
+      const sel = this.selectedElements();
+      if (sel.length && sel.every((e) => e.type === sel[0].type) && isBox(sel[0])) selShape = sel[0].type;
+    }
     return {
       tool: this.tool,
       color,
@@ -231,7 +272,9 @@ export class Whiteboard {
       canUndo: this.past.length > 0,
       canRedo: this.future.length > 0,
       selectionCount: this.selection.size,
-      showFill: this.tool === "rect" || this.tool === "ellipse" || hasBox,
+      showFill: isBoxType(this.tool) || hasBox,
+      lastShape: this.lastShape,
+      selShape,
       hasContent: this.elements.length > 0,
       // riusa lo stesso riferimento se i colori recenti non cambiano
       recentColors:
@@ -387,9 +430,11 @@ export class Whiteboard {
     // contenuto (spazio mondo)
     ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, -x * zoom * dpr, -y * zoom * dpr);
     const view: Rect = { x, y, w: this.viewW / zoom, h: this.viewH / zoom };
-    drawElements(ctx, this.elements, view, this.erasing, this.editing?.id ?? null, zoom);
-    if (this.draft) drawElement(ctx, this.draft);
-    for (const r of this.collab.remote()) if (r.draft) drawElement(ctx, r.draft);
+    const ed = this.editing;
+    const extra = { bg: this.bgColor, hideLabelId: ed?.label ? ed.id : null };
+    drawElements(ctx, this.elements, view, this.erasing, ed && !ed.label ? ed.id : null, zoom, extra);
+    if (this.draft) drawElement(ctx, this.draft, 1, { bg: this.bgColor });
+    for (const r of this.collab.remote()) if (r.draft) drawElement(ctx, r.draft, 1, { bg: this.bgColor });
 
     // overlay (spazio schermo)
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -412,7 +457,8 @@ export class Whiteboard {
           ctx.strokeRect(s.x, s.y, b.w * this.camera.zoom, b.h * this.camera.zoom);
         }
       }
-      const sb = this.selectionBounds();
+      const sb = this.singleLine() ? null : this.selectionBounds();
+      this.drawFlowHandles(ctx);
       if (sb) {
         const s = this.toScreen(sb);
         const w = sb.w * this.camera.zoom;
@@ -431,6 +477,20 @@ export class Whiteboard {
           ctx.fill();
           ctx.stroke();
         }
+      }
+    }
+
+    if (this.snapTarget) {
+      const t = this.elements.find((e) => e.id === this.snapTarget);
+      if (t) {
+        const b = inflate(geomBoundsOf(t), 6 / this.camera.zoom + t.width / 2);
+        const s = this.toScreen(b);
+        ctx.strokeStyle = accent;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.roundRect(s.x, s.y, b.w * this.camera.zoom, b.h * this.camera.zoom, 8);
+        ctx.stroke();
       }
     }
 
@@ -508,6 +568,112 @@ export class Whiteboard {
     }
   }
 
+  /* ---- diagrammi di flusso: maniglie ---- */
+
+  /** L'unico elemento selezionato, se è un collegamento (linea o freccia). */
+  private singleLine(): LineEl | null {
+    if (this.selection.size !== 1) return null;
+    const el = this.selectedElements()[0];
+    return el && isLine(el) ? el : null;
+  }
+
+  /** L'unica forma selezionata (per i pulsanti "+" del collegamento rapido). */
+  private singleBox(): BoxEl | null {
+    if (this.selection.size !== 1 || this.tool !== "select") return null;
+    const el = this.selectedElements()[0];
+    return el && isBox(el) ? el : null;
+  }
+
+  /** Posizioni (schermo) dei pulsanti "+" ai lati della forma selezionata. */
+  private plusPositions(box: BoxEl): Record<Side, Point> {
+    const s = this.toScreen(box);
+    const w = box.w * this.camera.zoom;
+    const h = box.h * this.camera.zoom;
+    const o = PLUS_OFFSET + (box.width * this.camera.zoom) / 2;
+    return {
+      top: { x: s.x + w / 2, y: s.y - o },
+      right: { x: s.x + w + o, y: s.y + h / 2 },
+      bottom: { x: s.x + w / 2, y: s.y + h + o },
+      left: { x: s.x - o, y: s.y + h / 2 },
+    };
+  }
+
+  /**
+   * Lati della forma senza collegamenti: solo lì compare il "+" (su un lato già collegato coprirebbe
+   * la freccia, e un clic sulla freccia creerebbe una forma nuova).
+   */
+  private freeSides(box: BoxEl): Side[] {
+    const used = new Set<Side>();
+    const c = centerOf(box);
+    for (const el of this.elements) {
+      if (!isLine(el)) continue;
+      for (const [p, id] of [[el.a, el.from], [el.b, el.to]] as const) {
+        if (id !== box.id) continue;
+        const dx = (p.x - c.x) / Math.max(box.w, 1);
+        const dy = (p.y - c.y) / Math.max(box.h, 1);
+        used.add(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : dy > 0 ? "bottom" : "top");
+      }
+    }
+    return SIDES.filter((s) => !used.has(s));
+  }
+
+  private plusAt(sp: Point): Side | null {
+    const box = this.singleBox();
+    if (!box || box.w * this.camera.zoom < 24 || box.h * this.camera.zoom < 16) return null;
+    const pos = this.plusPositions(box);
+    for (const side of this.freeSides(box)) if (dist(sp, pos[side]) <= PLUS_HIT) return side;
+    return null;
+  }
+
+  private endpointAt(sp: Point): "a" | "b" | null {
+    const l = this.singleLine();
+    if (!l) return null;
+    if (dist(sp, this.toScreen(l.b)) <= END_HIT) return "b";
+    if (dist(sp, this.toScreen(l.a)) <= END_HIT) return "a";
+    return null;
+  }
+
+  private drawFlowHandles(ctx: CanvasRenderingContext2D): void {
+    const accent = "#4c8dff";
+    const line = this.singleLine();
+    if (line) {
+      for (const end of ["a", "b"] as const) {
+        const p = this.toScreen(line[end]);
+        const bound = end === "a" ? line.from : line.to;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+        ctx.fillStyle = bound ? accent : "#ffffff";
+        ctx.strokeStyle = bound ? "#ffffff" : accent;
+        ctx.lineWidth = 2;
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+    const box = this.action ? null : this.singleBox();
+    if (box && box.w * this.camera.zoom >= 24 && box.h * this.camera.zoom >= 16) {
+      const pos = this.plusPositions(box);
+      for (const side of this.freeSides(box)) {
+        const p = pos[side];
+        const hot = this.hover && dist(this.hover, p) <= PLUS_HIT;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+        ctx.fillStyle = hot ? accent : "#ffffff";
+        ctx.strokeStyle = accent;
+        ctx.lineWidth = 1.5;
+        ctx.fill();
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(p.x - 4, p.y);
+        ctx.lineTo(p.x + 4, p.y);
+        ctx.moveTo(p.x, p.y - 4);
+        ctx.lineTo(p.x, p.y + 4);
+        ctx.strokeStyle = hot ? "#ffffff" : accent;
+        ctx.lineWidth = 1.8;
+        ctx.stroke();
+      }
+    }
+  }
+
   private eraserRadiusPx(): number {
     return 8 + this.style.width;
   }
@@ -569,6 +735,7 @@ export class Whiteboard {
 
   /** Da chiamare dopo ogni modifica del documento. */
   private changed(): void {
+    this.elements = resolveConnectors(this.elements);
     this.collab.localChanged();
     this.requestRender();
     this.scheduleSave();
@@ -603,7 +770,11 @@ export class Whiteboard {
 
   setTool = (tool: ToolId): void => {
     if (this.editing) this.finishEdit();
-    if (this.tool === tool) return;
+    if (isBoxType(tool)) this.lastShape = tool;
+    if (this.tool === tool) {
+      this.emit();
+      return;
+    }
     this.tool = tool;
     if (tool !== "select") this.selection.clear();
     this.updateCursor();
@@ -633,9 +804,19 @@ export class Whiteboard {
 
   setFill = (fill: boolean): void => {
     this.style.fill = fill;
-    this.mutateSelection((el) => (el.type === "rect" || el.type === "ellipse" ? { ...el, fill } : el));
+    this.mutateSelection((el) => (isBox(el) ? { ...el, fill } : el));
     this.scheduleSave();
     this.emit();
+  };
+
+  /** Cambia il tipo delle forme selezionate (es. da processo a decisione): etichette e frecce restano. */
+  setShape = (type: BoxType): void => {
+    this.lastShape = type;
+    if (!this.selectedElements().some(isBox)) {
+      this.emit();
+      return;
+    }
+    this.mutateSelection((el) => (isBox(el) ? { ...el, type } : el));
   };
 
   setBgColor = (color: string): void => {
@@ -714,7 +895,12 @@ export class Whiteboard {
   };
 
   private insertCopies(src: El[], dx: number, dy: number): void {
-    const copies = src.map((el) => ({ ...translateEl(el, dx, dy), id: newId() }) as El);
+    const idMap = new Map<string, string>();
+    for (const el of src) idMap.set(el.id, newId());
+    const copies = remapBindings(
+      src.map((el) => ({ ...translateEl(el, dx, dy), id: idMap.get(el.id)! }) as El),
+      idMap,
+    );
     this.record();
     this.elements = [...this.elements, ...copies];
     this.tool = "select";
@@ -1031,6 +1217,10 @@ export class Whiteboard {
     const ed = this.editing;
     if (!ed) return;
     this.editing = null;
+    if (ed.label) {
+      this.finishLabel(ed);
+      return;
+    }
     const text = ed.text.replace(/\s+$/, "");
 
     if (ed.id) {
@@ -1063,6 +1253,150 @@ export class Whiteboard {
       this.updateCursor();
     }
     this.changed();
+  }
+
+  /* ======================================================================
+   * Diagrammi di flusso: etichette, forme piazzate con un clic, collegamento rapido
+   * ==================================================================== */
+
+  /** Forma più in alto che contiene il punto (anche se vuota e non riempita). */
+  private boxAt(wp: Point): BoxEl | null {
+    return bindTargetAt(this.elements, wp, 0);
+  }
+
+  /** Un collegamento spostato senza la sua forma si stacca da lei. */
+  private detach(el: El): El {
+    return isLine(el) ? detachFrom(el, this.selection) : el;
+  }
+
+  /** Apre la textarea per scrivere l'etichetta di una forma o di una freccia. */
+  private startLabelEdit(el: BoxEl | LineEl): void {
+    this.editSession++;
+    let box: Rect;
+    if (isLine(el)) {
+      const mx = (el.a.x + el.b.x) / 2;
+      const my = (el.a.y + el.b.y) / 2;
+      box = { x: mx - ARROW_LABEL_MAX / 2, y: my - LABEL_LINE / 2, w: ARROW_LABEL_MAX, h: LABEL_LINE };
+    } else {
+      box = labelArea(el);
+    }
+    this.editing = {
+      session: this.editSession,
+      id: el.id,
+      x: box.x,
+      y: box.y,
+      text: el.label ?? "",
+      fontSize: LABEL_SIZE,
+      color: el.color,
+      label: { box },
+    };
+    this.selection.clear();
+    this.requestRender();
+    this.emit();
+  }
+
+  /**
+   * Fa stare l'etichetta nella forma, ingrandendola attorno al centro: prima in larghezza (fino a
+   * FIT_MAX_W, perché un testo lungo in una colonna stretta si legge male), poi in altezza. Si ripete
+   * perché l'area del testo dipende dalle dimensioni (rombo, parallelogramma).
+   */
+  private fitLabel(el: BoxEl): BoxEl {
+    if (!el.label) return el;
+    let cur = el;
+    for (let i = 0; i < 12; i++) {
+      const n = wrapText(cur.label!, labelArea(cur).w, LABEL_SIZE).lines.length;
+      const need = heightForLabel(cur, n * LABEL_LINE);
+      if (n > 3 && cur.w < FIT_MAX_W) {
+        const w = Math.min(FIT_MAX_W, cur.w + 40);
+        cur = { ...cur, x: cur.x - (w - cur.w) / 2, w };
+      } else if (need > cur.h + 0.5) {
+        cur = { ...cur, y: cur.y - (need - cur.h) / 2, h: need };
+      } else {
+        break;
+      }
+    }
+    return cur;
+  }
+
+  /** Conclude la scrittura di un'etichetta: la salva (annullabile) e seleziona l'elemento. */
+  private finishLabel(ed: TextEdit): void {
+    const orig = ed.id ? this.elements.find((e) => e.id === ed.id) : undefined;
+    if (orig && (isBox(orig) || isLine(orig))) {
+      const text = ed.text.trim();
+      if (text !== (orig.label ?? "")) {
+        let next: El;
+        if (text) {
+          next = { ...orig, label: text };
+          if (isBox(next)) next = this.fitLabel(next);
+        } else {
+          const copy = { ...orig };
+          delete copy.label;
+          next = copy;
+        }
+        this.record();
+        this.elements = this.elements.map((e) => (e.id === orig.id ? next : e));
+      }
+      this.tool = "select";
+      this.selection = new Set([orig.id]);
+      this.updateCursor();
+    }
+    this.changed();
+  }
+
+  /** Piazza una forma di dimensioni standard centrata in `c` e apre la scrittura dell'etichetta. */
+  private placeBox(type: BoxType, c: Point): void {
+    const { w, h } = DEFAULT_SIZE[type];
+    const box: BoxEl = {
+      id: newId(),
+      type,
+      color: this.style.color,
+      width: this.style.width,
+      x: c.x - w / 2,
+      y: c.y - h / 2,
+      w,
+      h,
+      fill: this.style.fill,
+    };
+    this.addElement(box);
+    this.startLabelEdit(box);
+  }
+
+  /**
+   * Collegamento rapido: crea accanto alla forma selezionata (dal lato scelto) una forma uguale e
+   * vuota, collegata con una freccia, e apre subito la scrittura della sua etichetta.
+   */
+  private quickConnect(side: Side): void {
+    const src = this.singleBox();
+    if (!src) return;
+    const d = SIDE_DIR[side];
+    const step = { x: d.x * (src.w + FLOW_GAP), y: d.y * (src.h + FLOW_GAP) };
+    const base = { ...src };
+    delete base.label;
+    let cand: BoxEl = { ...base, id: newId(), x: src.x + step.x, y: src.y + step.y };
+    // se il posto è occupato da un'altra forma si va oltre, nella stessa direzione
+    const taken = (r: Rect) => this.elements.some((e) => isBox(e) && rectsIntersect(inflate(geomBoundsOf(e), 12), r));
+    for (let i = 0; i < 8 && taken(cand); i++) cand = { ...cand, x: cand.x + step.x, y: cand.y + step.y };
+    const arrow: LineEl = {
+      id: newId(),
+      type: "arrow",
+      color: src.color,
+      width: src.width,
+      a: centerOf(src),
+      b: centerOf(cand),
+      from: src.id,
+      to: cand.id,
+    };
+    this.record();
+    this.elements = [...this.elements, cand, arrow];
+    this.changed();
+    // la nuova forma deve restare visibile mentre ci si scrive
+    const view = this.visibleRect();
+    if (!rectContains(view, { x: cand.x, y: cand.y }) || !rectContains(view, { x: cand.x + cand.w, y: cand.y + cand.h })) {
+      this.camera.x += centerOf(cand).x - (view.x + view.w / 2);
+      this.camera.y += centerOf(cand).y - (view.y + view.h / 2);
+      this.cameraChanged();
+    }
+    this.startLabelEdit(cand);
   }
 
   /* ======================================================================
@@ -1101,6 +1435,7 @@ export class Whiteboard {
     const a = this.action;
     if (!a) return;
     this.action = null;
+    this.snapTarget = null;
     switch (a.kind) {
       case "pen":
       case "shape":
@@ -1111,6 +1446,7 @@ export class Whiteboard {
         break;
       case "move":
       case "resize":
+      case "endpoint":
         this.elements = a.origin;
         break;
       case "marquee":
@@ -1192,9 +1528,15 @@ export class Whiteboard {
       case "line":
       case "arrow":
       case "rect":
-      case "ellipse": {
-        this.action = { kind: "shape", pid: e.pointerId, start: wp };
-        this.draft = this.shapeDraft(this.tool, wp, wp, false);
+      case "ellipse":
+      case "diamond":
+      case "terminal":
+      case "data": {
+        const isLink = this.tool === "line" || this.tool === "arrow";
+        // un collegamento che parte da dentro una forma vi resta agganciato
+        const bind = isLink ? (bindTargetAt(this.elements, wp, 4 / this.camera.zoom)?.id ?? null) : null;
+        this.action = { kind: "shape", pid: e.pointerId, start: wp, startScreen: p, bind };
+        this.draft = this.shapeDraft(this.tool, wp, wp, false, bind);
         break;
       }
       case "eraser": {
@@ -1216,6 +1558,17 @@ export class Whiteboard {
   };
 
   private beginSelect(e: PointerEvent, p: Point, wp: Point): void {
+    const side = this.plusAt(p);
+    if (side) {
+      this.quickConnect(side);
+      return;
+    }
+    const end = this.endpointAt(p);
+    const line = this.singleLine();
+    if (end && line) {
+      this.action = { kind: "endpoint", pid: e.pointerId, end, id: line.id, origin: this.elements, moved: false };
+      return;
+    }
     const handle = this.handleAt(p);
     if (handle) {
       const g = this.selectionGeomBounds()!;
@@ -1299,9 +1652,32 @@ export class Whiteboard {
         break;
       }
       case "shape": {
-        if (this.tool === "line" || this.tool === "arrow" || this.tool === "rect" || this.tool === "ellipse") {
-          this.draft = this.shapeDraft(this.tool, a.start, this.toWorld(p), e.shiftKey);
+        const t = this.tool;
+        if (t === "line" || t === "arrow" || isBoxType(t)) {
+          const wp = this.toWorld(p);
+          let to: string | null = null;
+          if (t === "line" || t === "arrow") {
+            to = bindTargetAt(this.elements, wp, 4 / this.camera.zoom, a.bind ?? undefined)?.id ?? null;
+            this.snapTarget = to;
+          }
+          this.draft = this.shapeDraft(t, a.start, wp, e.shiftKey && !a.bind && !to, a.bind, to);
         }
+        break;
+      }
+      case "endpoint": {
+        const line = a.origin.find((x) => x.id === a.id);
+        if (!line || !isLine(line)) break;
+        const wp = this.toWorld(p);
+        // i due estremi non si agganciano alla stessa forma
+        const other = a.end === "a" ? line.to : line.from;
+        const tgt = bindTargetAt(a.origin, wp, 4 / this.camera.zoom, other);
+        this.snapTarget = tgt?.id ?? null;
+        const next: LineEl = { ...line, [a.end]: wp };
+        const key = a.end === "a" ? "from" : "to";
+        if (tgt) next[key] = tgt.id;
+        else delete next[key];
+        a.moved = true;
+        this.elements = resolveConnectors(a.origin.map((x) => (x.id === a.id ? next : x)));
         break;
       }
       case "erase": {
@@ -1316,7 +1692,9 @@ export class Whiteboard {
         const dy = wp.y - a.start.y;
         if (!a.moved && Math.hypot(dx, dy) * this.camera.zoom < 3) break;
         a.moved = true;
-        this.elements = a.origin.map((el) => (this.selection.has(el.id) ? translateEl(el, dx, dy) : el));
+        this.elements = resolveConnectors(
+          a.origin.map((el) => (this.selection.has(el.id) ? this.detach(translateEl(el, dx, dy)) : el)),
+        );
         break;
       }
       case "resize": {
@@ -1333,8 +1711,8 @@ export class Whiteboard {
         let sy = ratio(ty, a.anchor.y, a.corner.y);
         if (e.shiftKey) sx = sy = Math.max(sx, sy);
         a.moved = true;
-        this.elements = a.origin.map((el) =>
-          this.selection.has(el.id) ? scaleEl(el, a.anchor.x, a.anchor.y, sx, sy) : el,
+        this.elements = resolveConnectors(
+          a.origin.map((el) => (this.selection.has(el.id) ? this.detach(scaleEl(el, a.anchor.x, a.anchor.y, sx, sy)) : el)),
         );
         break;
       }
@@ -1414,9 +1792,21 @@ export class Whiteboard {
       case "shape": {
         const d = this.draft;
         this.draft = null;
-        if (d && this.isMeaningful(d)) this.addElement(d);
+        this.snapTarget = null;
+        if (!d) break;
+        const moved = dist(this.screenPoint(e), a.startScreen) >= 4;
+        // un clic con una forma ne piazza una di dimensioni standard, pronta per scriverci dentro
+        if (!moved && isBox(d)) this.placeBox(d.type, a.start);
+        else if (moved && this.isMeaningful(d)) this.addElement(d);
         break;
       }
+      case "endpoint":
+        this.snapTarget = null;
+        if (a.moved) {
+          this.record(a.origin);
+          this.changed();
+        }
+        break;
       case "erase": {
         if (this.erasing.size > 0) {
           const gone = this.erasing;
@@ -1444,7 +1834,12 @@ export class Whiteboard {
           const wp = this.toWorld(p);
           const hit = this.pick(wp, 4 / this.camera.zoom);
           if (hit && hit.type === "text") this.startTextEdit(wp, hit);
-          else this.startTextEdit(wp);
+          else {
+            // con lo strumento testo, un clic su una forma o una freccia ne scrive l'etichetta
+            const target = hit && (isBox(hit) || isLine(hit)) ? hit : this.boxAt(wp);
+            if (target) this.startLabelEdit(target);
+            else this.startTextEdit(wp);
+          }
         }
         break;
       }
@@ -1456,16 +1851,26 @@ export class Whiteboard {
     switch (el.type) {
       case "line":
       case "arrow":
-        return dist(el.a, el.b) * z >= 3;
+        return !isTinyLine(el, z) && (el.from !== el.to || !el.from);
       case "rect":
       case "ellipse":
+      case "diamond":
+      case "terminal":
+      case "data":
         return Math.max(el.w, el.h) * z >= 3;
       default:
         return true;
     }
   }
 
-  private shapeDraft(tool: "line" | "arrow" | "rect" | "ellipse", a: Point, b: Point, shift: boolean): El {
+  private shapeDraft(
+    tool: "line" | "arrow" | BoxType,
+    a: Point,
+    b: Point,
+    shift: boolean,
+    from: string | null = null,
+    to: string | null = null,
+  ): El {
     const base = { id: newId(), color: this.style.color, width: this.style.width };
     if (tool === "line" || tool === "arrow") {
       let end = b;
@@ -1475,7 +1880,10 @@ export class Whiteboard {
         const len = dist(a, b);
         end = { x: a.x + Math.cos(ang) * len, y: a.y + Math.sin(ang) * len };
       }
-      return { ...base, type: tool, a, b: end };
+      const line: LineEl = { ...base, type: tool, a, b: end };
+      if (from) line.from = from;
+      if (to) line.to = to;
+      return from || to ? resolveLine(line, (id) => this.elements.find((x) => x.id === id)) : line;
     }
     let dx = b.x - a.x;
     let dy = b.y - a.y;
@@ -1545,7 +1953,7 @@ export class Whiteboard {
   }
 
   private handleAt(sp: Point): Handle | null {
-    if (this.selection.size === 0) return null;
+    if (this.selection.size === 0 || this.singleLine()) return null;
     const sb = this.selectionBounds();
     if (!sb) return null;
     for (const h of HANDLES) {
@@ -1562,6 +1970,7 @@ export class Whiteboard {
     if (a?.kind === "pan") c = "grabbing";
     else if (this.spaceDown || this.tool === "hand") c = "grab";
     else if (a?.kind === "move") c = "move";
+    else if (a?.kind === "endpoint") c = "grabbing";
     else if (a?.kind === "resize") c = a.handle === "nw" || a.handle === "se" ? "nwse-resize" : "nesw-resize";
     else {
       switch (this.tool) {
@@ -1579,7 +1988,9 @@ export class Whiteboard {
           c = "text";
           break;
         case "select": {
-          if (p && !a) {
+          if (p && !a && this.plusAt(p)) c = "pointer";
+          else if (p && !a && this.endpointAt(p)) c = "grab";
+          else if (p && !a) {
             const h = this.handleAt(p);
             if (h) c = h === "nw" || h === "se" ? "nwse-resize" : "nesw-resize";
             else if (this.pick(this.toWorld(p), 6 / this.camera.zoom)) c = "move";
@@ -1600,8 +2011,13 @@ export class Whiteboard {
     const hit = this.pick(wp, 4 / this.camera.zoom);
     if (hit && hit.type === "text") {
       this.startTextEdit(wp, hit);
-    } else if (!hit && this.tool === "select") {
-      this.startTextEdit(wp);
+    } else if (hit && (isBox(hit) || isLine(hit))) {
+      this.startLabelEdit(hit);
+    } else {
+      // dentro una forma vuota: si scrive la sua etichetta, non un testo libero
+      const box = this.boxAt(wp);
+      if (box) this.startLabelEdit(box);
+      else if (!hit && this.tool === "select") this.startTextEdit(wp);
     }
   };
 
@@ -1744,6 +2160,19 @@ export class Whiteboard {
       case "o":
         this.setTool("ellipse");
         break;
+      case "d":
+        this.setTool("diamond");
+        break;
+      case "enter": {
+        // Invio sulla forma (o freccia, o testo) selezionata: si scrive dentro
+        if (this.selection.size !== 1) break;
+        const el = this.selectedElements()[0];
+        if (!el) break;
+        e.preventDefault();
+        if (el.type === "text") this.startTextEdit({ x: el.x, y: el.y }, el);
+        else if (isBox(el) || isLine(el)) this.startLabelEdit(el);
+        break;
+      }
       case "t":
         e.preventDefault(); // evita che la "t" finisca nella textarea appena aperta
         this.setTool("text");
@@ -1981,7 +2410,7 @@ export class Whiteboard {
       const ox = (W - area.w * scale) / 2 - area.x * scale;
       const oy = (H - area.h * scale) / 2 - area.y * scale;
       ctx.setTransform(scale, 0, 0, scale, ox, oy);
-      drawElements(ctx, this.elements, null, undefined, null, scale);
+      drawElements(ctx, this.elements, null, undefined, null, scale, { bg: this.bgColor });
       return canvas.toDataURL("image/jpeg", 0.72);
     } catch {
       return undefined;
@@ -2096,7 +2525,7 @@ export class Whiteboard {
       followView: (v) => this.followView(v),
       // durante un trascinamento locale `elements` viene ricalcolato da uno snapshot: gli aggiornamenti
       // remoti aspettano la fine del gesto (vedi Collab.flush)
-      isBusy: () => this.action?.kind === "move" || this.action?.kind === "resize",
+      isBusy: () => this.action?.kind === "move" || this.action?.kind === "resize" || this.action?.kind === "endpoint",
       setRemoteState: (n) => this.setRemoteState(n),
       invalidate: () => this.requestRender(),
       emit: () => this.emit(),
@@ -2107,8 +2536,12 @@ export class Whiteboard {
   /** Applica lo stato arrivato dagli altri partecipanti. Non entra nella history né viene rispedito. */
   private setRemoteState(n: { elements?: El[]; bgColor?: string; grid?: GridMode; pages?: number; first?: boolean }): void {
     if (n.elements) {
-      this.elements = n.elements;
+      // le forme spostate da altri trascinano le frecce agganciate; se il ricalcolo cambia qualcosa
+      // (es. due persone hanno spostato i due capi della stessa freccia) lo si condivide: tutti
+      // calcolano lo stesso risultato, quindi converge subito
+      this.elements = resolveConnectors(n.elements);
       this.pruneSelection();
+      if (this.elements !== n.elements) this.collab.localChanged();
     }
     if (n.bgColor) this.bgColor = n.bgColor;
     if (n.grid) this.grid = n.grid;
@@ -2266,7 +2699,7 @@ export class Whiteboard {
     ctx.fillStyle = this.bgColor;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(scale, 0, 0, scale, -area.x * scale, -area.y * scale);
-    drawElements(ctx, this.elements, null);
+    drawElements(ctx, this.elements, null, undefined, null, 1, { bg: this.bgColor });
 
     const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
     if (blob) downloadBlob(blob, `${slugify(this.boardName)}-${timestamp()}.png`);

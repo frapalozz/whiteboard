@@ -1,6 +1,6 @@
 import { GRIDS, parsePages, parseSaved } from "./collab/validate";
 import { MAX_ZOOM, MIN_ZOOM } from "./types";
-import type { BoardMeta, Camera, El, GridMode, PersistedBoard, Point } from "./types";
+import type { BoardMeta, BoxEl, Camera, El, GridMode, LineEl, PersistedBoard, Point } from "./types";
 
 /** Chiave usata dalla versione precedente (una sola lavagna): viene migrata al primo avvio. */
 export const LEGACY_KEY = "whiteboard:v1";
@@ -20,6 +20,11 @@ function point(v: unknown): Point | null {
 export function sanitizeColor(v: unknown, fallback: string): string {
   return typeof v === "string" && HEX.test(v) ? v.toLowerCase() : fallback;
 }
+
+/** Id di una forma a cui è agganciato un collegamento. */
+const ref = (v: unknown): string | null => (typeof v === "string" && v.length > 0 && v.length <= 100 ? v : null);
+/** Etichetta di forme e frecce (vuota = nessuna). */
+const labelOf = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.slice(0, 2000) : null);
 
 /** Valida un elemento proveniente da localStorage o da un file importato. */
 export function sanitizeElement(raw: unknown): El | null {
@@ -45,12 +50,22 @@ export function sanitizeElement(raw: unknown): El | null {
       const a = point(raw.a);
       const b = point(raw.b);
       if (!a || !b) return null;
-      return { id, type: raw.type, color, width, a, b };
+      const el: LineEl = { id, type: raw.type, color, width, a, b };
+      const from = ref(raw.from);
+      const to = ref(raw.to);
+      const label = labelOf(raw.label);
+      if (from) el.from = from;
+      if (to) el.to = to;
+      if (label) el.label = label;
+      return el;
     }
     case "rect":
-    case "ellipse": {
+    case "ellipse":
+    case "diamond":
+    case "terminal":
+    case "data": {
       if (!isNum(raw.x) || !isNum(raw.y) || !isNum(raw.w) || !isNum(raw.h)) return null;
-      return {
+      const el: BoxEl = {
         id,
         type: raw.type,
         color,
@@ -61,6 +76,9 @@ export function sanitizeElement(raw: unknown): El | null {
         h: Math.abs(raw.h),
         fill: raw.fill === true,
       };
+      const label = labelOf(raw.label);
+      if (label) el.label = label;
+      return el;
     }
     case "text": {
       if (!isNum(raw.x) || !isNum(raw.y) || typeof raw.text !== "string") return null;

@@ -23,7 +23,8 @@ export const SHARE_HARD_LIMIT = 1_500_000;
 /** Protezione da "zip bomb": dimensione massima del JSON decompresso. */
 const MAX_INFLATED = 40 * 1024 * 1024;
 
-const TYPES = ["stroke", "line", "arrow", "rect", "ellipse", "text"] as const;
+/** L'ordine conta (il link salva l'indice): aggiungere solo in fondo. */
+const TYPES = ["stroke", "line", "arrow", "rect", "ellipse", "text", "diamond", "terminal", "data"] as const;
 
 const q = (v: number) => Math.round(v * 100);
 const uq = (v: number) => v / 100;
@@ -33,7 +34,11 @@ const hex = (c: string) => c.replace(/^#/, "");
 
 type Packed = Array<number | string>;
 
-function packElement(el: El): Packed {
+/**
+ * `index`: posizione di ogni elemento nel link, per gli agganci delle frecce (gli id non viaggiano:
+ * vengono rigenerati dalla posizione). Campi facoltativi in coda, così i link vecchi restano validi.
+ */
+function packElement(el: El, index: Map<string, number>): Packed {
   const head: Packed = [TYPES.indexOf(el.type), hex(el.color), Math.round(el.width * 100) / 100];
   switch (el.type) {
     case "stroke": {
@@ -50,11 +55,23 @@ function packElement(el: El): Packed {
       return out;
     }
     case "line":
-    case "arrow":
-      return [...head, q(el.a.x), q(el.a.y), q(el.b.x), q(el.b.y)];
+    case "arrow": {
+      const out: Packed = [...head, q(el.a.x), q(el.a.y), q(el.b.x), q(el.b.y)];
+      const f = el.from ? (index.get(el.from) ?? -1) : -1;
+      const t = el.to ? (index.get(el.to) ?? -1) : -1;
+      if (f >= 0 || t >= 0 || el.label) out.push(f, t);
+      if (el.label) out.push(el.label);
+      return out;
+    }
     case "rect":
     case "ellipse":
-      return [...head, q(el.x), q(el.y), q(el.w), q(el.h), el.fill ? 1 : 0];
+    case "diamond":
+    case "terminal":
+    case "data": {
+      const out: Packed = [...head, q(el.x), q(el.y), q(el.w), q(el.h), el.fill ? 1 : 0];
+      if (el.label) out.push(el.label);
+      return out;
+    }
     case "text":
       return [...head, q(el.x), q(el.y), Math.round(el.fontSize * 100) / 100, el.text];
   }
@@ -80,11 +97,16 @@ function unpackElement(p: unknown, index: number): unknown {
       return { ...base, points };
     }
     case "line":
-    case "arrow":
-      return { ...base, a: { x: n(3), y: n(4) }, b: { x: n(5), y: n(6) } };
+    case "arrow": {
+      const at = (v: unknown) => (typeof v === "number" && v >= 0 && Number.isInteger(v) ? `sh${v.toString(36)}` : undefined);
+      return { ...base, a: { x: n(3), y: n(4) }, b: { x: n(5), y: n(6) }, from: at(p[7]), to: at(p[8]), label: p[9] };
+    }
     case "rect":
     case "ellipse":
-      return { ...base, x: n(3), y: n(4), w: n(5), h: n(6), fill: p[7] === 1 };
+    case "diamond":
+    case "terminal":
+    case "data":
+      return { ...base, x: n(3), y: n(4), w: n(5), h: n(6), fill: p[7] === 1, label: p[8] };
     case "text":
       return { ...base, x: n(3), y: n(4), fontSize: Number(p[5]), text: String(p[6] ?? "") };
   }
@@ -146,6 +168,7 @@ export async function inflate(data: Uint8Array): Promise<Uint8Array> {
 
 /** Codifica una lavagna nel valore del fragment (senza il prefisso `lavagna=`). */
 export async function encodeBoard(board: PersistedBoard): Promise<string> {
+  const index = new Map(board.elements.map((el, i) => [el.id, i]));
   const doc = {
     v: 1,
     n: board.name ?? "",
@@ -153,7 +176,7 @@ export async function encodeBoard(board: PersistedBoard): Promise<string> {
     g: board.grid ? GRIDS.indexOf(board.grid) : undefined,
     p: board.pages || undefined,
     c: board.camera ? [q(board.camera.x), q(board.camera.y), Math.round(board.camera.zoom * 1000) / 1000] : undefined,
-    e: board.elements.map(packElement),
+    e: board.elements.map((el) => packElement(el, index)),
   };
   const raw = new TextEncoder().encode(JSON.stringify(doc));
   if (hasStreams()) {
