@@ -2,6 +2,7 @@ import type { El, GridMode, Point, Rect } from "../types";
 import { accessOf, aclText, MAX_OVERRIDES, type Access, type Acl, type SignedAcl } from "./acl";
 import { authSupported, loadIdentity, newIdentity, sign, siteFor, verify, type Identity, type IdentitySaved } from "./auth";
 import { CollabDoc, MAX_POINTS, type Props } from "./doc";
+import { moveKey, type MovePreview } from "../preview";
 import { cleanName, colorFor, randomId } from "./protocol";
 import { CollabSession, webrtcSupported } from "./session";
 import { relaySupported } from "./relay";
@@ -14,7 +15,7 @@ export interface CollabHost {
   getProps(): Props;
   getBoardName(): string;
   /** `view`: area visibile in coordinate mondo (la segue chi ti segue). */
-  getPresence(): { cursor: Point | null; draft: El | null; view: Rect | null };
+  getPresence(): { cursor: Point | null; draft: El | null; view: Rect | null; moving: MovePreview | null };
   /** true durante un trascinamento/ridimensionamento locale: gli aggiornamenti remoti si rimandano. */
   isBusy(): boolean;
   /** Applica lo stato remoto al documento locale (senza history e senza rimandarlo in rete). */
@@ -34,6 +35,8 @@ export interface RemoteView {
   color: string;
   cursor: { x: number; y: number; t: number } | null;
   draft: El | null;
+  /** Elementi che sta trascinando in questo momento. */
+  moving: MovePreview | null;
   /** Ultima area visibile annunciata (coordinate mondo). */
   view: Rect | null;
   /** Chiede di essere seguito. */
@@ -71,6 +74,7 @@ export class Collab {
   private lastCursor = "";
   private draftSent: { id: string; n: number } | null = null;
   private draftKey = "";
+  private lastMove = "";
   private lastView = "";
   /** Stai chiedendo a tutti di seguirti. */
   private leading = false;
@@ -156,6 +160,7 @@ export class Collab {
     this.lastCursor = "";
     this.draftSent = null;
     this.draftKey = "";
+    this.lastMove = "";
     this.lastView = "";
     this.leading = false;
     this.following = null;
@@ -366,7 +371,7 @@ export class Collab {
       },
       {
         onPeerOpen: (peer) => {
-          this.remotes.set(peer.site, { site: peer.site, name: peer.name, color: peer.color, cursor: null, draft: null, view: null, leading: false });
+          this.remotes.set(peer.site, { site: peer.site, name: peer.name, color: peer.color, cursor: null, draft: null, moving: null, view: null, leading: false });
           // ognuno manda il proprio stato completo: il merge è idempotente
           for (const b of doc.snapshot()) this.session?.sendTo(peer.site, { t: "ops", b });
           // chi arriva a lezione iniziata sa subito chi seguire e cosa sta guardando
@@ -455,6 +460,13 @@ export class Collab {
         // modifiche (anche inoltrate) solo da chi può modificare e ha dimostrato chi è
         if (!this.trusted(from)) return;
         const r = doc.apply(msg.b);
+        // le modifiche finali di un trascinamento sostituiscono la sua anteprima (non va applicata due volte)
+        for (const v of this.remotes.values()) {
+          const mv = v.moving;
+          if (!mv) continue;
+          const ids = new Set(mv.ids);
+          if (msg.b.e.some((w) => w.s === v.site && ids.has(w.id))) v.moving = null;
+        }
         // chi è in sola lettura non inoltra: gli altri non accetterebbero comunque le sue modifiche
         if (r.forward && this.canEditSelf) for (const part of chunkBatch(r.forward)) this.session?.send({ t: "ops", b: part }, from);
         if (r.changed.size || r.props) {
@@ -488,6 +500,13 @@ export class Collab {
       case "dr":
         if (!rv || !this.trusted(from)) return;
         rv.draft = msg.el;
+        this.host.invalidate();
+        return;
+      case "mv":
+        if (!rv) return;
+        if (msg.ids.length === 0) rv.moving = null;
+        else if (!this.trusted(from)) return;
+        else rv.moving = msg.el ? { ids: msg.ids, el: msg.el } : { ids: msg.ids, m: msg.m ?? [0, 0] };
         this.host.invalidate();
         return;
       case "dend":
@@ -686,7 +705,15 @@ export class Collab {
   private flushPresence(): void {
     const s = this.session;
     if (!s) return;
-    const { cursor, draft, view } = this.host.getPresence();
+    const { cursor, draft, view, moving } = this.host.getPresence();
+
+    // trascinamento: la fine parte dopo le modifiche vere (mandate subito al rilascio), così chi guarda non
+    // vede l'elemento tornare indietro per un attimo
+    const mk = moveKey(moving);
+    if (mk !== this.lastMove) {
+      this.lastMove = mk;
+      s.send(moving ? { t: "mv", ...moving } : { t: "mv", ids: [] });
+    }
 
     if (view) {
       const r = roundRect(view);

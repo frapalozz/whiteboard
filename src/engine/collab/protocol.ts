@@ -1,6 +1,8 @@
 import { sanitizeColor, sanitizeElement } from "../storage";
 import { MAX_POINTS, parseBatch } from "./doc";
 import { parseSignedAcl } from "./acl";
+import { MAX_MOVE_IDS } from "../preview";
+import { isLine } from "../types";
 import type { Msg } from "./types";
 import { isNum, isObj, isStr } from "./validate";
 
@@ -63,6 +65,20 @@ export function parseMsg(raw: unknown): Msg | null {
     case "dr": {
       const el = sanitizeElement(raw.el);
       return el && el.type !== "stroke" && el.type !== "text" ? { t: "dr", el } : null;
+    }
+    case "mv": {
+      if (!Array.isArray(raw.ids) || raw.ids.length > MAX_MOVE_IDS || !raw.ids.every((id) => isStr(id, 100))) return null;
+      const ids = raw.ids as string[];
+      if (ids.length === 0) return { t: "mv", ids };
+      if (raw.el !== undefined) {
+        const el = sanitizeElement(raw.el);
+        return el && isLine(el) && ids.length === 1 && ids[0] === el.id ? { t: "mv", ids, el } : null;
+      }
+      const m = raw.m;
+      if (!Array.isArray(m) || (m.length !== 2 && m.length !== 4) || !m.every((v) => isNum(v) && Math.abs(v) < 1e7)) return null;
+      // scala: stessi limiti del ridimensionamento locale
+      if (m.length === 4 && (m[2] < 0.05 || m[3] < 0.05 || m[2] > 1e4 || m[3] > 1e4)) return null;
+      return { t: "mv", ids, m: m as number[] };
     }
     case "dend":
       return isStr(raw.id, 100) ? { t: "dend", id: raw.id } : null;

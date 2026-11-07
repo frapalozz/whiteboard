@@ -48,6 +48,8 @@ export type Msg =
   /** Forma in corso (linea, freccia, rettangolo, ellisse). */
   | { t: "dr"; el: El }
   | { t: "dend"; id: string }
+  /** Trascinamento in corso (vedi preview.ts); `ids` vuoto: finito. */
+  | { t: "mv"; ids: string[]; m?: number[]; el?: El }
   /** Area visibile in coordinate mondo: serve a chi segue questo partecipante. */
   | { t: "vw"; x: number; y: number; w: number; h: number }
   /** "Fatti seguire": chi lo riceve inizia (o smette) di seguire chi lo manda. */

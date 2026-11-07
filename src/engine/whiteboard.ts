@@ -34,6 +34,7 @@ import { bindTargetAt, detachFrom, isTinyLine, remapBindings, resolveConnectors,
 import { Collab, type CollabHost } from "./collab/controller";
 import type { Access } from "./collab/acl";
 import { drawEdgeMarks, edgeMarks } from "./edges";
+import { applyMove, MAX_MOVE_IDS, type MovePreview } from "./preview";
 import { drawElement, drawElements, drawGrid, drawPages, isDark } from "./render";
 import { buildShareUrl, SHARE_HARD_LIMIT } from "./share";
 import {
@@ -445,14 +446,22 @@ export class Whiteboard {
     const view: Rect = { x, y, w: this.viewW / zoom, h: this.viewH / zoom };
     const ed = this.editing;
     const extra = { bg: this.bgColor, hideLabelId: ed?.label ? ed.id : null };
-    drawElements(ctx, this.elements, view, this.erasing, ed && !ed.label ? ed.id : null, zoom, extra);
+    const shown = this.shownElements();
+    drawElements(ctx, shown, view, this.erasing, ed && !ed.label ? ed.id : null, zoom, extra);
     if (this.draft) drawElement(ctx, this.draft, 1, { bg: this.bgColor });
     for (const r of this.collab.remote()) if (r.draft) drawElement(ctx, r.draft, 1, { bg: this.bgColor });
 
     // overlay (spazio schermo): prima i segni di ciò che è fuori dalla vista
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    drawEdgeMarks(ctx, edgeMarks(this.elements, view, zoom, this.viewW, this.viewH), this.viewW, this.viewH);
+    drawEdgeMarks(ctx, edgeMarks(shown, view, zoom, this.viewW, this.viewH), this.viewW, this.viewH);
     this.drawOverlay(ctx);
+  }
+
+  /** Elementi da disegnare: il documento più i trascinamenti in corso degli altri partecipanti. */
+  private shownElements(): El[] {
+    let els = this.elements;
+    for (const r of this.collab.remote()) if (r.moving) els = applyMove(els, r.moving);
+    return els;
   }
 
   private drawOverlay(ctx: CanvasRenderingContext2D): void {
@@ -1461,6 +1470,8 @@ export class Whiteboard {
   /** Annulla l'azione in corso ripristinando lo stato precedente. */
   private cancelAction(): void {
     this.stopAutoPan();
+    this.movePreview = null;
+    this.collab.ping();
     const a = this.action;
     if (!a) return;
     this.action = null;
@@ -1715,6 +1726,7 @@ export class Whiteboard {
         else delete next[key];
         a.moved = true;
         this.elements = resolveConnectors(a.origin.map((x) => (x.id === a.id ? next : x)));
+        this.movePreview = { ids: [a.id], el: next };
         break;
       }
       case "erase": {
@@ -1732,6 +1744,7 @@ export class Whiteboard {
         this.elements = resolveConnectors(
           a.origin.map((el) => (this.selection.has(el.id) ? this.detach(translateEl(el, dx, dy)) : el)),
         );
+        this.setMovePreview([dx, dy]);
         break;
       }
       case "resize": {
@@ -1751,6 +1764,7 @@ export class Whiteboard {
         this.elements = resolveConnectors(
           a.origin.map((el) => (this.selection.has(el.id) ? this.detach(scaleEl(el, a.anchor.x, a.anchor.y, sx, sy)) : el)),
         );
+        this.setMovePreview([a.anchor.x, a.anchor.y, sx, sy]);
         break;
       }
       case "marquee": {
@@ -1767,6 +1781,18 @@ export class Whiteboard {
         break;
     }
     this.requestRender();
+  }
+
+  /* ---- trascinamento visibile in tempo reale agli altri partecipanti ---- */
+
+  private movePreview: MovePreview | null = null;
+
+  private setMovePreview(m: number[]): void {
+    if (this.selection.size > MAX_MOVE_IDS) return;
+    const prev = this.movePreview;
+    // gli id cambiano solo all'inizio del trascinamento: si riusa l'array
+    const ids = prev && "m" in prev && prev.ids.length === this.selection.size ? prev.ids : [...this.selection];
+    this.movePreview = { ids, m };
   }
 
   /* ---- scorrimento automatico vicino ai bordi ---- */
@@ -1838,6 +1864,7 @@ export class Whiteboard {
 
   private endPointer(e: PointerEvent, cancelled: boolean): void {
     this.stopAutoPan();
+    if (this.movePreview && this.action?.pid === e.pointerId) this.movePreview = null;
     this.pointers.delete(e.pointerId);
     if (this.pointers.size < 2 && this.gesture) {
       this.gesture = null;
@@ -2621,7 +2648,12 @@ export class Whiteboard {
       getElements: () => this.elements,
       getProps: () => ({ bgColor: this.bgColor, grid: this.grid, pages: this.pages }),
       getBoardName: () => this.boardName,
-      getPresence: () => ({ cursor: this.presenceCursor, draft: this.draft, view: this.canvas ? this.visibleRect() : null }),
+      getPresence: () => ({
+        cursor: this.presenceCursor,
+        draft: this.draft,
+        view: this.canvas ? this.visibleRect() : null,
+        moving: this.movePreview,
+      }),
       followView: (v) => this.followView(v),
       accessChanged: () => this.onAccessChanged(),
       // durante un trascinamento locale `elements` viene ricalcolato da uno snapshot: gli aggiornamenti

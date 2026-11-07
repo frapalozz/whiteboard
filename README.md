@@ -42,7 +42,7 @@ npm run typecheck
   dispositivo a dispositivo. Pulsante "Collabora" in alto a destra: si manda un link e chi lo apre entra da solo (collegamento
   automatico); se il telefono mette il browser in background o la pagina si ricarica, la connessione si riforma da sola.
   Resta disponibile l'invito manuale (link + codice di risposta) senza alcun server.
-  Cursori con nome, tratti visibili mentre vengono disegnati, undo/redo che annulla solo le *tue* azioni. Vedi sotto.
+  Cursori con nome, tratti visibili mentre vengono disegnati, spostamenti e ridimensionamenti visibili mentre avvengono, undo/redo che annulla solo le *tue* azioni. Vedi sotto.
 - **Permessi**: avviando la collaborazione scegli se chi entra con il link può *modificare* o *solo guardare*. Dopo puoi
   cambiare idea per tutti (interruttore "Chi entra può modificare") o per una singola persona (pulsante accanto al suo nome).
   Chi è in sola lettura vede tutto in tempo reale, si muove, segue la lezione, e può premere "Chiedi di modificare": la
@@ -132,6 +132,12 @@ e diventa un'operazione. Il merge è commutativo e idempotente, quindi i peer co
 e ogni peer inoltra agli altri solo ciò che ha cambiato il proprio stato (gossip senza cicli). Le cancellazioni sono lapidi, l'ordine z è
 una chiave frazionaria per elemento. Lo storico di undo/redo è ri-agganciato (`rebase`) al lavoro altrui: annulli le tue azioni, non quelle degli altri.
 Durante un trascinamento locale gli aggiornamenti remoti aspettano la fine del gesto.
+
+**Trascinamenti in tempo reale.** Mentre sposti o ridimensioni qualcosa, gli altri lo vedono muoversi: come per cursori e
+tratti in corso, viaggia un messaggio di presenza effimero (`mv`, preview.ts) che non tocca il documento. Contiene solo gli id
+e la trasformazione (`[dx, dy]` o `[ax, ay, sx, sy]`; per l'estremo di una freccia, la freccia), quindi resta piccolo anche con
+tratti lunghi; chi lo riceve la applica alla propria copia e ricalcola le frecce agganciate. Al rilascio partono le modifiche
+vere, che sostituiscono l'anteprima.
 
 **Frecce agganciate.** Una freccia ricorda l'id delle forme ai suoi capi (`from`/`to`); i suoi punti restano salvati come
 normali coordinate (export, link e versioni precedenti la disegnano comunque) ma vengono ricalcolati dopo ogni modifica,
