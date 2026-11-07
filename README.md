@@ -56,6 +56,10 @@ npm run typecheck
   (pagina, zoom, spostamenti); chi entra a lezione iniziata ti segue subito. Si può anche seguire una persona sola dal
   pulsante "Segui" accanto al suo nome. Chi segue può scrivere sulla pagina; appena sposta la vista da solo smette di
   seguire, e la barra della lezione mostra chi stai seguendo con un pulsante per smettere.
+- **Bordi che guidano**: trascinando un elemento (o una forma, una freccia, un ridimensionamento, una selezione) vicino al
+  bordo dello schermo la lavagna scorre da sola in quella direzione, più veloce quanto più ti avvicini. Ai bordi una striscia
+  di pochi pixel, del colore dell'elemento e alla sua altezza (o larghezza), segnala ciò che è fuori dalla vista; se due
+  elementi stanno nella stessa direzione si vede il più vicino.
 - **Interfaccia**: pannelli "vetro" chiari o scuri secondo il tema del sistema, strumenti raggruppati con tooltip e
   scorciatoie, pannello proprietà contestuale, notifiche, layout adattato a mobile e touch.
 - Supporto mouse, touch e penna (Pointer Events), schermi HiDPI, ridimensionamento finestra.

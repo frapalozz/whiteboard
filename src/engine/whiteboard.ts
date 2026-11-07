@@ -33,6 +33,7 @@ import {
 import { bindTargetAt, detachFrom, isTinyLine, remapBindings, resolveConnectors, resolveLine } from "./flow";
 import { Collab, type CollabHost } from "./collab/controller";
 import type { Access } from "./collab/acl";
+import { drawEdgeMarks, edgeMarks } from "./edges";
 import { drawElement, drawElements, drawGrid, drawPages, isDark } from "./render";
 import { buildShareUrl, SHARE_HARD_LIMIT } from "./share";
 import {
@@ -68,6 +69,8 @@ import type {
 } from "./types";
 
 const HISTORY_LIMIT = 200;
+/** Velocità massima dello scorrimento automatico (px schermo al secondo), con il puntatore sul bordo o oltre. */
+const AUTOPAN_MAX = 900;
 /** Raggio (px schermo) delle maniglie degli estremi e dei pulsanti "+" del collegamento rapido. */
 const END_HIT = 11;
 const PLUS_OFFSET = 26;
@@ -366,6 +369,7 @@ export class Whiteboard {
       window.removeEventListener("pagehide", this.onPageHide);
       document.removeEventListener("visibilitychange", this.onVisibility);
       if (this.raf) cancelAnimationFrame(this.raf);
+      this.stopAutoPan();
       this.raf = 0;
       this.canvas = null;
       this.ctx = null;
@@ -445,8 +449,9 @@ export class Whiteboard {
     if (this.draft) drawElement(ctx, this.draft, 1, { bg: this.bgColor });
     for (const r of this.collab.remote()) if (r.draft) drawElement(ctx, r.draft, 1, { bg: this.bgColor });
 
-    // overlay (spazio schermo)
+    // overlay (spazio schermo): prima i segni di ciò che è fuori dalla vista
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawEdgeMarks(ctx, edgeMarks(this.elements, view, zoom, this.viewW, this.viewH), this.viewW, this.viewH);
     this.drawOverlay(ctx);
   }
 
@@ -1455,6 +1460,7 @@ export class Whiteboard {
 
   /** Annulla l'azione in corso ripristinando lo stato precedente. */
   private cancelAction(): void {
+    this.stopAutoPan();
     const a = this.action;
     if (!a) return;
     this.action = null;
@@ -1650,7 +1656,15 @@ export class Whiteboard {
       this.requestRender();
       return;
     }
+    this.dragTo(a, p, e.shiftKey, e);
+    this.autoPanCheck(p, e.shiftKey);
+  };
 
+  /**
+   * Aggiorna l'azione in corso con il puntatore in `p` (schermo). La chiama anche lo scorrimento automatico,
+   * che sposta la vista tenendo fermo il puntatore: senza evento (`e`), la penna non aggiunge punti.
+   */
+  private dragTo(a: Action, p: Point, shiftKey: boolean, e?: PointerEvent): void {
     switch (a.kind) {
       case "pan": {
         this.userCamera();
@@ -1662,7 +1676,7 @@ export class Whiteboard {
       }
       case "pen": {
         const d = this.draft;
-        if (d && d.type === "stroke") {
+        if (d && d.type === "stroke" && e) {
           const events = typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() : [];
           const list = events.length ? events : [e];
           const minDist = 1 / this.camera.zoom;
@@ -1683,7 +1697,7 @@ export class Whiteboard {
             to = bindTargetAt(this.elements, wp, 4 / this.camera.zoom, a.bind ?? undefined)?.id ?? null;
             this.snapTarget = to;
           }
-          this.draft = this.shapeDraft(t, a.start, wp, e.shiftKey && !a.bind && !to, a.bind, to);
+          this.draft = this.shapeDraft(t, a.start, wp, shiftKey && !a.bind && !to, a.bind, to);
         }
         break;
       }
@@ -1732,7 +1746,7 @@ export class Whiteboard {
         };
         let sx = ratio(tx, a.anchor.x, a.corner.x);
         let sy = ratio(ty, a.anchor.y, a.corner.y);
-        if (e.shiftKey) sx = sy = Math.max(sx, sy);
+        if (shiftKey) sx = sy = Math.max(sx, sy);
         a.moved = true;
         this.elements = resolveConnectors(
           a.origin.map((el) => (this.selection.has(el.id) ? this.detach(scaleEl(el, a.anchor.x, a.anchor.y, sx, sy)) : el)),
@@ -1753,7 +1767,66 @@ export class Whiteboard {
         break;
     }
     this.requestRender();
+  }
+
+  /* ---- scorrimento automatico vicino ai bordi ---- */
+
+  private autoPan: { p: Point; shift: boolean; last: number; raf: number } | null = null;
+
+  /** Velocità (px schermo al secondo) con il puntatore in `p`: zero lontano dai bordi o se il trascinamento non è iniziato. */
+  private autoPanVelocity(p: Point): Point {
+    const a = this.action;
+    if (!a || this.gesture) return { x: 0, y: 0 };
+    const active =
+      a.kind === "marquee" ||
+      a.kind === "resize" ||
+      ((a.kind === "move" || a.kind === "endpoint") && a.moved) ||
+      (a.kind === "shape" && dist(p, a.startScreen) >= 4);
+    if (!active) return { x: 0, y: 0 };
+    const margin = Math.min(48, Math.max(24, Math.min(this.viewW, this.viewH) * 0.06));
+    const speed = (d: number) => {
+      const t = clamp((margin - d) / margin, 0, 1);
+      return t * t * AUTOPAN_MAX;
+    };
+    return { x: speed(this.viewW - p.x) - speed(p.x), y: speed(this.viewH - p.y) - speed(p.y) };
+  }
+
+  private autoPanCheck(p: Point, shift: boolean): void {
+    const v = this.autoPanVelocity(p);
+    if (v.x === 0 && v.y === 0) {
+      this.stopAutoPan();
+      return;
+    }
+    if (this.autoPan) {
+      this.autoPan.p = p;
+      this.autoPan.shift = shift;
+      return;
+    }
+    this.autoPan = { p, shift, last: performance.now(), raf: requestAnimationFrame(this.autoPanTick) };
+  }
+
+  private autoPanTick = (now: number): void => {
+    const ap = this.autoPan;
+    const a = this.action;
+    if (!ap || !a) return this.stopAutoPan();
+    const v = this.autoPanVelocity(ap.p);
+    if (v.x === 0 && v.y === 0) return this.stopAutoPan();
+    const dt = Math.min(0.05, Math.max(0, (now - ap.last) / 1000));
+    ap.last = now;
+    this.userCamera();
+    this.camera.x += (v.x * dt) / this.camera.zoom;
+    this.camera.y += (v.y * dt) / this.camera.zoom;
+    // il puntatore resta fermo sullo schermo ma ora indica un altro punto del mondo
+    this.presenceCursor = this.toWorld(ap.p);
+    this.dragTo(a, ap.p, ap.shift);
+    this.cameraChanged();
+    ap.raf = requestAnimationFrame(this.autoPanTick);
   };
+
+  private stopAutoPan(): void {
+    if (this.autoPan) cancelAnimationFrame(this.autoPan.raf);
+    this.autoPan = null;
+  }
 
   private onPointerUp = (e: PointerEvent): void => {
     this.endPointer(e, false);
@@ -1764,6 +1837,7 @@ export class Whiteboard {
   };
 
   private endPointer(e: PointerEvent, cancelled: boolean): void {
+    this.stopAutoPan();
     this.pointers.delete(e.pointerId);
     if (this.pointers.size < 2 && this.gesture) {
       this.gesture = null;
