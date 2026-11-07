@@ -32,6 +32,7 @@ import {
 } from "./geometry";
 import { bindTargetAt, detachFrom, isTinyLine, remapBindings, resolveConnectors, resolveLine } from "./flow";
 import { Collab, type CollabHost } from "./collab/controller";
+import type { Access } from "./collab/acl";
 import { drawElement, drawElements, drawGrid, drawPages, isDark } from "./render";
 import { buildShareUrl, SHARE_HARD_LIMIT } from "./share";
 import {
@@ -237,6 +238,11 @@ export class Whiteboard {
   getSnapshot = (): UIState => this.snapshot;
   getServerSnapshot = (): UIState => this.snapshot;
 
+  /** In una lavagna condivisa in sola lettura: si guarda e ci si muove, ma non si modifica nulla. */
+  get readOnly(): boolean {
+    return !this.collab.canEditSelf;
+  }
+
   private buildSnapshot(): UIState {
     // Con una selezione, il pannello mostra lo stile degli elementi selezionati
     // (se è uniforme), altrimenti quello dello strumento.
@@ -263,6 +269,7 @@ export class Whiteboard {
     }
     return {
       tool: this.tool,
+      readOnly: this.readOnly,
       color,
       width,
       fill,
@@ -295,6 +302,8 @@ export class Whiteboard {
   }
 
   private emit(): void {
+    // i permessi cambiano anche entrando in una stanza o aprendo una lavagna condivisa
+    if (this.readOnly !== this.wasReadOnly) return this.onAccessChanged();
     const next = this.buildSnapshot();
     if (shallowEqual(this.snapshot, next)) return;
     this.snapshot = next;
@@ -701,6 +710,7 @@ export class Whiteboard {
   }
 
   undo = (): void => {
+    if (this.readOnly) return;
     if (this.editing) this.finishEdit();
     const prev = this.past.pop();
     if (!prev) return;
@@ -712,6 +722,7 @@ export class Whiteboard {
   };
 
   redo = (): void => {
+    if (this.readOnly) return;
     if (this.editing) this.finishEdit();
     const next = this.future.pop();
     if (!next) return;
@@ -758,7 +769,7 @@ export class Whiteboard {
   }
 
   private mutateSelection(fn: (el: El) => El, key?: string): void {
-    if (this.selection.size === 0) return;
+    if (this.selection.size === 0 || this.readOnly) return;
     this.record(this.elements, key);
     this.elements = this.elements.map((el) => (this.selection.has(el.id) ? fn(el) : el));
     this.changed();
@@ -769,6 +780,11 @@ export class Whiteboard {
    * ==================================================================== */
 
   setTool = (tool: ToolId): void => {
+    // in sola lettura c'è solo la mano
+    if (this.readOnly && tool !== "hand") {
+      this.emit();
+      return;
+    }
     if (this.editing) this.finishEdit();
     if (isBoxType(tool)) this.lastShape = tool;
     if (this.tool === tool) {
@@ -811,6 +827,7 @@ export class Whiteboard {
 
   /** Cambia il tipo delle forme selezionate (es. da processo a decisione): etichette e frecce restano. */
   setShape = (type: BoxType): void => {
+    if (this.readOnly) return;
     this.lastShape = type;
     if (!this.selectedElements().some(isBox)) {
       this.emit();
@@ -820,6 +837,7 @@ export class Whiteboard {
   };
 
   setBgColor = (color: string): void => {
+    if (this.readOnly) return;
     const wasDark = isDark(this.bgColor);
     this.bgColor = color;
     // la penna nera su sfondo scuro (o bianca su chiaro) sarebbe invisibile
@@ -832,6 +850,7 @@ export class Whiteboard {
   };
 
   setGrid = (grid: GridMode): void => {
+    if (this.readOnly) return;
     this.grid = grid;
     this.changed();
   };
@@ -862,7 +881,7 @@ export class Whiteboard {
   };
 
   deleteSelection = (): void => {
-    if (this.selection.size === 0) return;
+    if (this.selection.size === 0 || this.readOnly) return;
     this.record();
     this.elements = this.elements.filter((e) => !this.selection.has(e.id));
     this.selection.clear();
@@ -883,6 +902,7 @@ export class Whiteboard {
   };
 
   cutSelection = (): void => {
+    if (this.readOnly) return;
     this.copySelection();
     this.deleteSelection();
   };
@@ -895,6 +915,7 @@ export class Whiteboard {
   };
 
   private insertCopies(src: El[], dx: number, dy: number): void {
+    if (this.readOnly) return;
     const idMap = new Map<string, string>();
     for (const el of src) idMap.set(el.id, newId());
     const copies = remapBindings(
@@ -910,7 +931,7 @@ export class Whiteboard {
   }
 
   bringToFront = (): void => {
-    if (this.selection.size === 0) return;
+    if (this.selection.size === 0 || this.readOnly) return;
     this.record();
     const rest = this.elements.filter((e) => !this.selection.has(e.id));
     this.elements = [...rest, ...this.selectedElements()];
@@ -918,7 +939,7 @@ export class Whiteboard {
   };
 
   sendToBack = (): void => {
-    if (this.selection.size === 0) return;
+    if (this.selection.size === 0 || this.readOnly) return;
     this.record();
     const rest = this.elements.filter((e) => !this.selection.has(e.id));
     this.elements = [...this.selectedElements(), ...rest];
@@ -931,7 +952,7 @@ export class Whiteboard {
 
   clear = (): void => {
     if (this.editing) this.finishEdit();
-    if (this.elements.length === 0) return;
+    if (this.elements.length === 0 || this.readOnly) return;
     this.record();
     this.elements = [];
     this.selection.clear();
@@ -1061,7 +1082,7 @@ export class Whiteboard {
 
   /** Attiva o disattiva le pagine. Il contenuto non si sposta: i fogli partono da (0, 0). */
   setPagesMode = (on: boolean): void => {
-    if (on === this.pages > 0) return;
+    if (on === this.pages > 0 || this.readOnly) return;
     if (this.editing) this.finishEdit();
     this.pages = on ? 1 : 0;
     if (on) {
@@ -1096,7 +1117,7 @@ export class Whiteboard {
   /** Aggiunge una pagina in fondo e la mostra. */
   addPage = (): void => {
     const n = this.pageCount();
-    if (n === 0 || n >= MAX_PAGES) return;
+    if (n === 0 || n >= MAX_PAGES || this.readOnly) return;
     this.pages = n + 1;
     this.changed();
     this.goToPage(n);
@@ -1111,7 +1132,7 @@ export class Whiteboard {
    */
   deletePage = (i: number): void => {
     const n = this.pageCount();
-    if (n <= 1 || i < 0 || i >= n) return;
+    if (n <= 1 || i < 0 || i >= n || this.readOnly) return;
     if (this.editing) this.finishEdit();
     const next: El[] = [];
     let touched = false;
@@ -1174,6 +1195,7 @@ export class Whiteboard {
    * ==================================================================== */
 
   private startTextEdit(world: Point, existing?: TextEl): void {
+    if (this.readOnly) return;
     this.editSession++;
     if (existing) {
       this.editing = {
@@ -1271,6 +1293,7 @@ export class Whiteboard {
 
   /** Apre la textarea per scrivere l'etichetta di una forma o di una freccia. */
   private startLabelEdit(el: BoxEl | LineEl): void {
+    if (this.readOnly) return;
     this.editSession++;
     let box: Rect;
     if (isLine(el)) {
@@ -1504,7 +1527,7 @@ export class Whiteboard {
     const active = document.activeElement as HTMLElement | null;
     if (active && active !== document.body && active !== this.canvas) active.blur?.();
 
-    const wantsPan = e.button === 1 || e.button === 2 || this.spaceDown || this.tool === "hand";
+    const wantsPan = e.button === 1 || e.button === 2 || this.spaceDown || this.tool === "hand" || this.readOnly;
     if (wantsPan) {
       this.action = { kind: "pan", pid: e.pointerId, last: p };
       this.updateCursor(p);
@@ -2006,7 +2029,7 @@ export class Whiteboard {
   }
 
   private onDoubleClick = (e: MouseEvent): void => {
-    if (this.tool !== "select" && this.tool !== "text") return;
+    if ((this.tool !== "select" && this.tool !== "text") || this.readOnly) return;
     const wp = this.toWorld(this.screenPoint(e));
     const hit = this.pick(wp, 4 / this.camera.zoom);
     if (hit && hit.type === "text") {
@@ -2117,6 +2140,8 @@ export class Whiteboard {
       return;
     }
     if (e.altKey) return;
+    // in sola lettura restano solo la navigazione tra le pagine e la vista
+    const viewOnly = this.readOnly;
 
     // modalità lezione: Pagina giù/su, e le frecce quando non c'è niente di selezionato
     if (this.pageCount() > 0 && !e.shiftKey) {
@@ -2133,6 +2158,7 @@ export class Whiteboard {
       }
     }
 
+    if (viewOnly && k !== "1" && k !== "escape") return;
     const step = (e.shiftKey ? 10 : 1) / this.camera.zoom;
     switch (k) {
       case "v":
@@ -2523,6 +2549,7 @@ export class Whiteboard {
       getBoardName: () => this.boardName,
       getPresence: () => ({ cursor: this.presenceCursor, draft: this.draft, view: this.canvas ? this.visibleRect() : null }),
       followView: (v) => this.followView(v),
+      accessChanged: () => this.onAccessChanged(),
       // durante un trascinamento locale `elements` viene ricalcolato da uno snapshot: gli aggiornamenti
       // remoti aspettano la fine del gesto (vedi Collab.flush)
       isBusy: () => this.action?.kind === "move" || this.action?.kind === "resize" || this.action?.kind === "endpoint",
@@ -2541,7 +2568,7 @@ export class Whiteboard {
       // calcolano lo stesso risultato, quindi converge subito
       this.elements = resolveConnectors(n.elements);
       this.pruneSelection();
-      if (this.elements !== n.elements) this.collab.localChanged();
+      if (this.elements !== n.elements && !this.readOnly) this.collab.localChanged();
     }
     if (n.bgColor) this.bgColor = n.bgColor;
     if (n.grid) this.grid = n.grid;
@@ -2552,15 +2579,48 @@ export class Whiteboard {
     this.emit();
   }
 
+  /** I tuoi permessi sono cambiati: in sola lettura si chiude ciò che stavi facendo e resta la mano. */
+  private wasReadOnly = false;
+
+  private onAccessChanged(): void {
+    this.wasReadOnly = this.readOnly;
+    if (this.readOnly) {
+      this.editing = null;
+      this.action = null;
+      this.draft = null;
+      this.selection.clear();
+      this.past = [];
+      this.future = [];
+      this.tool = "hand";
+    } else if (this.tool === "hand") {
+      this.tool = "select";
+    }
+    this.updateCursor();
+    this.requestRender();
+    this.emit();
+  }
+
   private onPageHide = (e: PageTransitionEvent): void => {
     if (!e.persisted) this.collab.farewell();
   };
 
   /** Rende collaborativa la lavagna corrente: da qui si possono creare inviti. */
-  startCollab = (name: string): { ok: true } | { ok: false; error: string } => {
+  startCollab = (name: string, access: Access = "edit"): ReturnType<Collab["startHost"]> => {
     if (this.editing) this.finishEdit();
-    return this.collab.startHost(name);
+    return this.collab.startHost(name, access);
   };
+
+  /** Proprietario: chi entra può modificare ("edit") o solo guardare ("view"). */
+  setDefaultAccess = (access: Access): Promise<void> => this.collab.setDefaultAccess(access);
+
+  /** Proprietario: dà o toglie a un partecipante la possibilità di modificare. */
+  setPeerAccess = (site: string, access: Access): Promise<void> => this.collab.setAccess(site, access);
+
+  /** In sola lettura: chiedi al proprietario di poter modificare. */
+  askEditAccess = (): void => this.collab.askAccess();
+
+  /** Proprietario: ignora una richiesta di modifica. */
+  dismissAccessRequest = (site: string): void => this.collab.dismissRequest(site);
 
   /** Crea un invito (link + codice) per una persona. */
   createInvite = (): ReturnType<Collab["createInvite"]> => this.collab.createInvite();

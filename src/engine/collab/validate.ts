@@ -1,5 +1,7 @@
 import { MAX_PAGES, type GridMode } from "../types";
-import { MAX_ENTRIES, type CollabSaved, type Reg } from "./types";
+import { parseSignedAcl } from "./acl";
+import { parseIdentitySaved } from "./auth";
+import { MAX_ENTRIES, type CollabSaved, type Reg, type SecSaved } from "./types";
 
 /**
  * Validatori senza dipendenze dal resto del motore (così `storage.ts` può usarli senza cicli di import).
@@ -54,5 +56,13 @@ export function parseSaved(raw: unknown): CollabSaved | undefined {
     bg: (raw.bg === undefined ? null : parseBgReg(raw.bg)) ?? undefined,
     grid: (raw.grid === undefined ? null : parseGridReg(raw.grid)) ?? undefined,
     pages: (raw.pages === undefined ? null : parsePagesReg(raw.pages)) ?? undefined,
+    sec: parseSec(raw.sec),
+    id: parseIdentitySaved(raw.id),
   };
+}
+
+function parseSec(raw: unknown): SecSaved | undefined {
+  if (!isObj(raw) || !isStr(raw.hk, 300) || !isStr(raw.hs, 40)) return undefined;
+  const acl = parseSignedAcl(raw.acl);
+  return acl ? { hk: raw.hk, hs: raw.hs, acl } : undefined;
 }

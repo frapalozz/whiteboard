@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import type { Access } from "@/engine/collab/acl";
 import { relaySupported } from "@/engine/collab/relay";
 import { webrtcSupported } from "@/engine/collab/session";
 import { decodeInvite, type AnyInvite } from "@/engine/collab/signaling";
@@ -65,6 +66,8 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
   /** Esito della decodifica di `joinText` (l'invito, o null se non valido). */
   const [decoded, setDecoded] = useState<{ text: string; inv: AnyInvite | null } | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Scelta iniziale: chi entra può modificare o solo guardare. */
+  const [startAccess, setStartAccess] = useState<Access>("edit");
   const [error, setError] = useState<string | null>(null);
   /** Link della stanza (riutilizzabile, con il relay). */
   const [roomUrl, setRoomUrl] = useState<string | null>(null);
@@ -109,7 +112,7 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
     return () => {
       alive = false;
     };
-  }, [wb, active, relayOk, c.room, c.name]);
+  }, [wb, active, relayOk, c.room, c.name, c.defaultAccess, c.editors.join()]);
 
   // quando qualcuno si collega, l'invito manuale e la risposta pendenti hanno fatto il loro lavoro
   const peerCount = c.peers.length;
@@ -131,8 +134,9 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
     }
   }
 
-  function start() {
-    const r = wb.startCollab(name);
+  async function start() {
+    const r = await run(() => wb.startCollab(name, startAccess));
+    if (!r) return;
     if (!r.ok) setError(r.error);
     else if (!relayOk) void makeInvite();
   }
@@ -169,8 +173,42 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
       <Dot color={c.color} />
       <span className="truncate font-medium">{c.name || "Ospite"}</span>
       <span className={`text-xs ${subtle}`}>(tu)</span>
+      {c.secured && (
+        <span className={`ml-auto shrink-0 text-xs ${subtle}`}>{c.owner ? "proprietario" : c.canEdit ? "può modificare" : "solo lettura"}</span>
+      )}
     </li>
   );
+
+  const accessChoice = (
+    <fieldset className="flex flex-col gap-1.5">
+      <legend className={`${label} mb-1.5`}>Chi entra con il link può</legend>
+      <div className="grid grid-cols-2 gap-2">
+        {(
+          [
+            ["edit", "Modificare", "Disegnare, scrivere e cancellare"],
+            ["view", "Solo guardare", "Dai tu il permesso a chi vuoi"],
+          ] as const
+        ).map(([v, title, hint]) => (
+          <label
+            key={v}
+            className={`flex cursor-pointer flex-col gap-0.5 rounded-xl p-2.5 text-sm ring-1 transition-colors ${
+              startAccess === v ? "bg-indigo-500/10 ring-indigo-500" : "ring-black/10 hover:bg-black/5 dark:ring-white/15 dark:hover:bg-white/5"
+            }`}
+          >
+            <span className="flex items-center gap-2 font-medium">
+              <input type="radio" name="collab-access" value={v} checked={startAccess === v} onChange={() => setStartAccess(v)} className="accent-indigo-600" />
+              {title}
+            </span>
+            <span className={`text-xs ${subtle}`}>{hint}</span>
+          </label>
+        ))}
+      </div>
+      <p className={`text-xs ${subtle}`}>Potrai cambiarlo quando vuoi, anche per una singola persona.</p>
+    </fieldset>
+  );
+
+  const ownerSite = c.ownerSite;
+  const requests = c.requests;
 
   const relayStatus =
     c.relayState === "on"
@@ -274,10 +312,11 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
             )}
 
             {!preview && (
-              <div className="flex flex-col gap-2">
-                <button type="button" disabled={!supported || busy} onClick={start} className={primary}>
+              <div className="flex flex-col gap-3">
+                {accessChoice}
+                <button type="button" disabled={!supported || busy} onClick={() => void start()} className={primary}>
                   <Icon>{icons.users}</Icon>
-                  Collabora su questa lavagna
+                  {busy ? "Preparo la stanza…" : "Collabora su questa lavagna"}
                 </button>
                 <p className={`text-xs ${subtle}`}>Ottieni un link da mandare a chi vuoi. La lavagna resta anche nel tuo browser e funziona offline.</p>
               </div>
@@ -310,19 +349,110 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
               </p>
             )}
 
+            {c.secured && !c.canEdit && (
+              <section className="flex flex-col gap-2 rounded-xl bg-amber-500/10 p-3">
+                <p className="text-sm">
+                  <b>Sei in sola lettura.</b> Puoi guardare, muoverti e seguire gli altri, ma non modificare la lavagna.
+                </p>
+                <button type="button" disabled={c.asked} onClick={wb.askEditAccess} className={secondary}>
+                  {c.asked ? "Richiesta inviata al proprietario" : "Chiedi di poter modificare"}
+                </button>
+                {c.asked && !c.peers.some((p) => p.site === ownerSite) && (
+                  <p className={`text-xs ${subtle}`}>Il proprietario non è collegato: riceverà la richiesta appena entra.</p>
+                )}
+              </section>
+            )}
+
+            {c.owner && requests.length > 0 && (
+              <section className="flex flex-col gap-2 rounded-xl bg-indigo-500/10 p-3">
+                <span className={label}>Chiedono di modificare</span>
+                <ul className="flex flex-col gap-1.5">
+                  {requests.map((site) => {
+                    const p = c.peers.find((x) => x.site === site);
+                    return (
+                      <li key={site} className="flex items-center gap-2 text-sm">
+                        {p && <Dot color={p.color} />}
+                        <span className="min-w-0 flex-1 truncate">{p?.name ?? "Partecipante"}</span>
+                        <button
+                          type="button"
+                          onClick={() => void wb.setPeerAccess(site, "edit")}
+                          className="shrink-0 rounded-lg bg-indigo-600 px-2 py-1 text-xs font-semibold text-white hover:bg-indigo-500"
+                        >
+                          Consenti
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => wb.dismissAccessRequest(site)}
+                          className="shrink-0 rounded-lg px-2 py-1 text-xs font-medium hover:bg-black/5 dark:hover:bg-white/10"
+                        >
+                          Ignora
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            )}
+
+            {c.owner && c.defaultAccess && (
+              <section className="flex flex-col gap-1">
+                <Switch
+                  checked={c.defaultAccess === "edit"}
+                  onChange={(v) => void wb.setDefaultAccess(v ? "edit" : "view")}
+                  label="Chi entra può modificare"
+                />
+                <p className={`text-xs ${subtle}`}>
+                  {c.defaultAccess === "edit"
+                    ? "Tutti possono disegnare e cancellare. Togli il permesso a una persona dall'elenco qui sotto."
+                    : "Chi entra può solo guardare. Dai il permesso a chi vuoi dall'elenco qui sotto."}
+                </p>
+              </section>
+            )}
+
             <section className="flex flex-col gap-2">
               <span className={label}>Partecipanti</span>
               <ul className="flex flex-col gap-1.5">
                 {you}
                 {c.peers.map((p) => {
                   const followingThis = c.following === p.site;
+                  const isOwnerPeer = c.secured && p.site === ownerSite;
+                  const editsPeer = c.editors.includes(p.site);
                   return (
-                    <li key={p.site} className="flex items-center gap-2 text-sm">
+                    <li key={p.site} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
                       <Dot color={p.color} />
                       <span className="min-w-0 flex-1 truncate">
                         {p.name}
                         {c.leaders.includes(p.site) && <span className={`ml-1.5 text-xs ${subtle}`}>guida la lezione</span>}
+                        {c.secured && !c.owner && (
+                          <span className={`ml-1.5 text-xs ${subtle}`}>
+                            {isOwnerPeer ? "proprietario" : editsPeer ? "modifica" : "solo lettura"}
+                          </span>
+                        )}
                       </span>
+                      {c.owner && (
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={editsPeer}
+                          aria-label={`${p.name} può modificare`}
+                          disabled={!p.authed}
+                          title={
+                            !p.authed
+                              ? "Usa una versione vecchia dell'app: può solo guardare"
+                              : editsPeer
+                                ? "Togli il permesso di modificare"
+                                : "Permetti di modificare"
+                          }
+                          onClick={() => void wb.setPeerAccess(p.site, editsPeer ? "view" : "edit")}
+                          className={`shrink-0 rounded-lg px-2 py-1 text-xs font-medium transition-colors disabled:opacity-40 ${
+                            editsPeer
+                              ? "bg-emerald-500/15 text-emerald-700 hover:bg-emerald-500/25 dark:text-emerald-300"
+                              : "bg-black/5 hover:bg-black/10 dark:bg-white/10 dark:hover:bg-white/15"
+                          }`}
+                        >
+                          {editsPeer ? "Può modificare" : "Solo lettura"}
+                        </button>
+                      )}
                       <button
                         type="button"
                         aria-pressed={followingThis}
@@ -341,7 +471,7 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
                   );
                 })}
               </ul>
-              {c.peers.length > 0 && (
+              {c.peers.length > 0 && c.canEdit && (
                 <div className="mt-1 flex flex-col gap-1">
                   <Switch checked={c.leading} onChange={wb.setLeading} label="Fatti seguire da tutti" />
                   <p className={`text-xs ${subtle}`}>
@@ -453,9 +583,13 @@ export default function CollabDialog({ wb, ui, invite, onClose, notify }: Props)
           <summary className="cursor-pointer font-medium">Privacy e impostazioni</summary>
           <div className="mt-2 flex flex-col gap-2">
             <p>
-              I disegni passano solo da dispositivo a dispositivo. Chi ha il link diventa un partecipante a tutti gli effetti, e può
-              modificare e cancellare: condividilo solo con chi vuoi. Il lavoro è salvato in ogni browser e si riunisce alla riconnessione.
+              I disegni passano solo da dispositivo a dispositivo: condividi il link solo con chi vuoi. Chi lo apre può modificare o solo
+              guardare, come decide chi ha avviato la collaborazione. I permessi sono firmati con una chiave che resta nel suo browser:
+              nessun altro può cambiarli o darseli da solo. Il lavoro è salvato in ogni browser e si riunisce alla riconnessione.
             </p>
+            {c.mode !== "off" && !c.secured && (
+              <p>Questa stanza è stata creata prima dei permessi: tutti possono modificare. Per sceglierli, avvia una nuova collaborazione.</p>
+            )}
             <div className="rounded-xl bg-black/5 p-3 dark:bg-white/10">
               <Switch checked={c.relay} onChange={(v) => wb.setCollabRelay(v)} label="Collegamento automatico (relay)" />
               <p className="mt-1.5">

@@ -1,3 +1,5 @@
+import type { SignedAcl } from "./acl";
+import { fingerprints, helloText, siteFor, verify } from "./auth";
 import { colorFor, parseMsg, randomId, RX_FRAME_MAX, RX_MESSAGE_MAX, RX_PARTS_MAX, toFrames } from "./protocol";
 import { Relay, relaySupported, type RelayMsg, type RelayState } from "./relay";
 import { buildInviteUrl, decodeAnswer, encodeAnswer, encodeInvite, type Invite } from "./signaling";
@@ -23,6 +25,8 @@ export interface SessionOpts {
   stun: boolean;
   /** Segnalazione automatica attraverso broker pubblici (vedi relay.ts). */
   relay: boolean;
+  /** La tua identità: firma il saluto di ogni canale (null: saluto senza firma, come le versioni precedenti). */
+  auth: { pk: string; sign(text: string): Promise<string> } | null;
 }
 
 export interface SessionEvents {
@@ -50,6 +54,11 @@ interface Conn {
   closed: boolean;
   /** Nata da un invito manuale (codici copiati a mano). */
   manual: boolean;
+  /** Saluto ricevuto, firma in verifica: i messaggi che arrivano intanto aspettano in `backlog`. */
+  verifying: boolean;
+  backlog: unknown[];
+  /** L'altro ha dimostrato di possedere la chiave del suo id. */
+  authed: boolean;
   queue: string[];
   rx: Map<string, Rx>;
   timers: Set<ReturnType<typeof setTimeout>>;
@@ -73,6 +82,8 @@ const ANNOUNCE_MS = 20_000;
 /** Un canale aperto da meno di così non si considera "zombie" (l'altro può non averlo ancora registrato). */
 const STALE_GRACE = 15_000;
 const HIGH_WATER = 1 << 20;
+/** Messaggi tenuti da parte durante la verifica del saluto (poi il canale si chiude). */
+const BACKLOG_MAX = 500;
 const LOW_WATER = 1 << 18;
 
 export function webrtcSupported(): boolean {
@@ -204,6 +215,11 @@ export class CollabSession {
     return [...this.peers.values()].map((c) => c.info as PeerInfo);
   }
 
+  /** `site` ha dimostrato la sua identità su questo canale. */
+  isAuthed(site: string): boolean {
+    return this.peers.get(site)?.authed ?? false;
+  }
+
   get pendingInvites(): number {
     return this.invites.size;
   }
@@ -212,7 +228,8 @@ export class CollabSession {
    * Invito manuale (host) e risposta (ospite)
    * ------------------------------------------------------------------- */
 
-  async createInvite(boardName: string): Promise<{ id: string; code: string; url: string }> {
+  /** `sec`: chiave del proprietario e permessi firmati, inclusi nell'invito (stanze con permessi). */
+  async createInvite(boardName: string, sec?: { k: string; a: SignedAcl }): Promise<{ id: string; code: string; url: string }> {
     while (this.invites.size >= MAX_INVITES) {
       const [k, v] = this.invites.entries().next().value as [string, { conn: Conn }];
       this.invites.delete(k);
@@ -228,7 +245,7 @@ export class CollabSession {
       await gathered(c.pc);
       const sdp = c.pc.localDescription?.sdp;
       if (!sdp) throw new Error("sdp");
-      const code = await encodeInvite({ i: id, room: this.opts.room, s: this.opts.site, n: this.opts.name, b: boardName, sdp });
+      const code = await encodeInvite({ i: id, room: this.opts.room, s: this.opts.site, n: this.opts.name, b: boardName, sdp, ...sec });
       return { id, code, url: buildInviteUrl(code) };
     } catch (e) {
       this.invites.delete(id);
@@ -333,7 +350,22 @@ export class CollabSession {
 
   private makeConn(): Conn {
     const pc = new RTCPeerConnection({ iceServers: this.opts.stun ? STUN : [] });
-    const c: Conn = { pc, dc: null, site: null, info: null, ready: false, since: 0, closed: false, manual: false, queue: [], rx: new Map(), timers: new Set() };
+    const c: Conn = {
+      pc,
+      dc: null,
+      site: null,
+      info: null,
+      ready: false,
+      since: 0,
+      closed: false,
+      manual: false,
+      verifying: false,
+      backlog: [],
+      authed: false,
+      queue: [],
+      rx: new Map(),
+      timers: new Set(),
+    };
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
       // un invito manuale non ancora aperto resta in attesa: l'altro può essere momentaneamente in background
@@ -356,7 +388,7 @@ export class CollabSession {
     c.dc = dc;
     dc.bufferedAmountLowThreshold = LOW_WATER;
     const hello = () => {
-      this.sendConn(c, { t: "hi", room: this.opts.room, site: this.opts.site, name: this.opts.name });
+      void this.sendHello(c);
       this.timeout(c, HI_TIMEOUT);
     };
     dc.onopen = hello;
@@ -364,6 +396,56 @@ export class CollabSession {
     dc.onclose = () => this.drop(c);
     dc.onbufferedamountlow = () => this.pump(c);
     if (dc.readyState === "open") hello();
+  }
+
+  /** Saluto, firmato con l'impronta DTLS del nostro lato del canale (se abbiamo un'identità). */
+  private async sendHello(c: Conn): Promise<void> {
+    const { room, site, name, auth } = this.opts;
+    if (auth) {
+      try {
+        const sig = await auth.sign(helloText(room, site, fingerprints(c.pc.localDescription?.sdp)));
+        if (!c.closed) this.sendConn(c, { t: "hi", room, site, name, pk: auth.pk, sig });
+        return;
+      } catch {
+        /* firma non riuscita: saluto semplice */
+      }
+    }
+    this.sendConn(c, { t: "hi", room, site, name });
+  }
+
+  /**
+   * Verifica il saluto: true = identità dimostrata, null = saluto senza firma (versione precedente),
+   * false = firma o id falsi (il canale si chiude).
+   */
+  private async checkHello(c: Conn, msg: Extract<Msg, { t: "hi" }>): Promise<boolean | null> {
+    if (!msg.pk || !msg.sig) return null;
+    try {
+      if ((await siteFor(msg.pk)) !== msg.site) return false;
+      return await verify(msg.pk, helloText(this.opts.room, msg.site, fingerprints(c.pc.remoteDescription?.sdp)), msg.sig);
+    } catch {
+      return false;
+    }
+  }
+
+  private accept(c: Conn, msg: Extract<Msg, { t: "hi" }>, authed: boolean): void {
+    // un nuovo canale con chi risulta già collegato: quello vecchio è morto senza che ce ne accorgessimo.
+    // Solo dopo la verifica: altrimenti chiunque potrebbe staccare un partecipante usando il suo id.
+    const old = this.peers.get(msg.site);
+    if (old && old !== c) {
+      // un saluto senza firma non sostituisce un canale con identità dimostrata
+      if (old.authed && !authed) return this.drop(c);
+      this.drop(old);
+    }
+    c.site = msg.site;
+    c.authed = authed;
+    c.info = { site: msg.site, name: msg.name, color: colorFor(msg.site), authed };
+    c.ready = true;
+    c.since = Date.now();
+    this.peers.set(msg.site, c);
+    this.linking.delete(msg.site);
+    this.ev.onPeerOpen(c.info);
+    this.announce();
+    this.ev.onChange();
   }
 
   private closeConn(c: Conn): void {
@@ -444,29 +526,35 @@ export class CollabSession {
   private handle(c: Conn, raw: unknown): void {
     const msg = parseMsg(raw);
     if (!msg) return;
-    if (!c.ready && msg.t !== "hi") return;
+    if (!c.ready && msg.t !== "hi") {
+      // l'altro ci ha già accolto e manda il suo stato mentre verifichiamo il suo saluto
+      if (c.verifying) {
+        if (c.backlog.length >= BACKLOG_MAX) return this.drop(c);
+        c.backlog.push(raw);
+      }
+      return;
+    }
 
     switch (msg.t) {
       case "hi": {
-        if (c.ready) return;
+        if (c.ready || c.verifying) return;
         if (msg.room !== this.opts.room) {
           this.roomMismatch = true;
           this.drop(c);
           return;
         }
         if (msg.site === this.opts.site) return this.drop(c);
-        // un nuovo canale con chi risulta già collegato: quello vecchio è morto senza che ce ne accorgessimo
-        const old = this.peers.get(msg.site);
-        if (old) this.drop(old);
-        c.site = msg.site;
-        c.info = { site: msg.site, name: msg.name, color: colorFor(msg.site) };
-        c.ready = true;
-        c.since = Date.now();
-        this.peers.set(msg.site, c);
-        this.linking.delete(msg.site);
-        this.ev.onPeerOpen(c.info);
-        this.announce();
-        this.ev.onChange();
+        c.verifying = true;
+        void this.checkHello(c, msg).then((ok) => {
+          c.verifying = false;
+          if (c.closed || this.dead) return;
+          if (ok === false) return this.drop(c);
+          this.accept(c, msg, ok === true);
+          if (!c.ready) return;
+          const backlog = c.backlog;
+          c.backlog = [];
+          for (const m of backlog) this.handle(c, m);
+        });
         return;
       }
       case "peers":

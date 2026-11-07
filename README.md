@@ -43,6 +43,10 @@ npm run typecheck
   automatico); se il telefono mette il browser in background o la pagina si ricarica, la connessione si riforma da sola.
   Resta disponibile l'invito manuale (link + codice di risposta) senza alcun server.
   Cursori con nome, tratti visibili mentre vengono disegnati, undo/redo che annulla solo le *tue* azioni. Vedi sotto.
+- **Permessi**: avviando la collaborazione scegli se chi entra con il link può *modificare* o *solo guardare*. Dopo puoi
+  cambiare idea per tutti (interruttore "Chi entra può modificare") o per una singola persona (pulsante accanto al suo nome).
+  Chi è in sola lettura vede tutto in tempo reale, si muove, segue la lezione, e può premere "Chiedi di modificare": la
+  richiesta compare a chi ha avviato la collaborazione con "Consenti" / "Ignora".
 - **Modalità lezione**: dal menu "Sfondo, griglia e pagine" si attivano le *pagine in sequenza*: fogli 16:10 uno sotto
   l'altro, con lo sfondo a quadretti o a righe come un quaderno. Una barra in basso (in alto sul telefono) sfoglia le pagine
   (‹ ›, Pagina su/giù, o le frecce quando non c'è niente di selezionato), ne aggiunge una in fondo o elimina quella corrente
@@ -96,6 +100,8 @@ src/engine/collab/
   signaling.ts    link della stanza e inviti manuali (SDP compressa) nel fragment dell'URL (#collab=…)
   relay.ts        segnalazione automatica: client MQTT minimo su WebSocket verso broker pubblici, messaggi cifrati AES-GCM
   session.ts      mesh WebRTC: un canale dati per coppia, segnalazione assistita dai peer già collegati, backpressure
+  auth.ts         identità dei partecipanti (ECDSA P-256, WebCrypto): id del sito ricavato dalla chiave, saluto firmato
+  acl.ts          permessi della stanza firmati dal proprietario (chi può modificare, chi solo guardare)
   controller.ts   unisce documento, trasporto e presenza; si aggancia al motore tramite l'interfaccia CollabHost
   validate.ts     validatori puri (usati anche da storage.ts)
 src/components/CollabDialog.tsx   interfaccia (avvio, inviti, partecipanti, privacy)
@@ -137,13 +143,30 @@ usa due messaggi di presenza, effimeri come i cursori: `vw` (l'area visibile in 
 ("fatti seguire"). Chi segue adatta quell'area al proprio schermo; a metà di un tratto la vista aspetta la fine del gesto. Le versioni
 precedenti dell'app ignorano questi messaggi e il numero di pagine, quindi una stanza mista continua a funzionare.
 
+**Permessi senza server.** Non c'è un server che possa dire chi è chi, quindi i permessi si reggono sulla crittografia:
+- Chi avvia la collaborazione genera una coppia di chiavi (ECDSA P-256) che resta nel suo browser con la lavagna. Firma i
+  permessi `{v, def, ov}` (versione, accesso predefinito, eccezioni per persona) legandoli all'id della stanza; la chiave pubblica
+  e l'ultima versione firmata viaggiano nel link. Ogni partecipante verifica da solo la firma: nessuno può darsi il permesso.
+- Ogni partecipante ha la sua chiave; il suo id è l'hash della chiave pubblica. Nel saluto di ogni canale WebRTC firma l'impronta
+  DTLS del proprio lato, che l'altro confronta con quella che vede: non si può usare l'id di un altro, né riusare una firma copiata.
+  I messaggi arrivati prima della verifica aspettano in coda.
+- Un peer accetta modifiche (anche inoltrate) solo da chi ha dimostrato la sua identità e può modificare; chi è in sola lettura non
+  inoltra nulla. I permessi si propagano come le modifiche (vale la versione firmata più alta), quindi arrivano anche a chi non è
+  collegato direttamente al proprietario. In sola lettura l'interfaccia mostra solo la mano e ogni modifica locale viene scartata.
+- Le stanze create prima dei permessi continuano a funzionare come prima (tutti modificano). Le versioni precedenti dell'app non
+  sanno firmare il saluto: in una stanza con permessi possono solo guardare.
+
 **Local-first.** Ogni partecipante tiene la propria copia in localStorage (con i metadati di sincronizzazione), anche offline. Se ricarichi
 la pagina la lavagna resta e, con il collegamento automatico, rientra nella stanza da sola (con l'invito manuale serve un nuovo
 invito di chi è ancora nella stanza). Chi apre un invito ottiene una *nuova* lavagna nella libreria, a meno che ne abbia già una
 di quella stanza: in quel caso viene riaperta quella, senza doppioni. "Esci dalla collaborazione" la rende di nuovo una lavagna normale.
 
 **Limiti e fiducia.**
-- Chi ha il link è un partecipante a pieno titolo (può modificare e cancellare): non c'è autenticazione.
+- Chi ha il link vede la lavagna: i permessi decidono chi modifica, non chi guarda. Condividilo solo con chi vuoi.
+- Solo chi ha avviato la collaborazione può cambiare i permessi, e solo dal browser in cui l'ha avviata: se ne cancella i dati, i
+  permessi restano quelli dell'ultima versione.
+- Chi è in sola lettura riceve il contenuto da chi può modificare: se è online solo lui, aspetta che entri qualcun altro.
+- Una modifica partita un attimo prima di una revoca può ancora arrivare a chi non ha ricevuto i nuovi permessi.
 - Il collegamento automatico dipende da broker MQTT pubblici gratuiti: se nessuno è raggiungibile l'app lo dice e propone l'invito manuale.
 - Con una rete molto restrittiva (NAT simmetrico, firewall aziendali, alcune reti mobili 4G/5G) il collegamento diretto può fallire senza un relay TURN, che qui non c'è: in quel caso conviene il Wi-Fi.
 - Il server STUN pubblico (opzionale, attivo di default) vede l'IP, mai i contenuti. Disattivato, funziona solo nella stessa rete locale.

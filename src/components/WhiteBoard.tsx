@@ -114,7 +114,8 @@ export default function WhiteBoard() {
     }
   }
 
-  const hasSelection = ui.selectionCount > 0;
+  const readOnly = ui.readOnly;
+  const hasSelection = ui.selectionCount > 0 && !readOnly;
   const dark = isDark(ui.bgColor);
 
   return (
@@ -130,13 +131,17 @@ export default function WhiteBoard() {
 
         {/* In alto a destra: annulla/ripeti, sfondo, file */}
         <div className={`${panel} absolute right-2 top-2 flex items-center gap-0.5 p-1.5`}>
-          <Btn label="Annulla" shortcut="Ctrl+Z" disabled={!ui.canUndo} onClick={wb.undo}>
-            {icons.undo}
-          </Btn>
-          <Btn label="Ripeti" shortcut="Ctrl+Shift+Z" disabled={!ui.canRedo} onClick={wb.redo}>
-            {icons.redo}
-          </Btn>
-          <div className="mx-1 h-6 w-px bg-black/10 dark:bg-white/15" />
+          {!readOnly && (
+            <>
+              <Btn label="Annulla" shortcut="Ctrl+Z" disabled={!ui.canUndo} onClick={wb.undo}>
+                {icons.undo}
+              </Btn>
+              <Btn label="Ripeti" shortcut="Ctrl+Shift+Z" disabled={!ui.canRedo} onClick={wb.redo}>
+                {icons.redo}
+              </Btn>
+              <div className="mx-1 h-6 w-px bg-black/10 dark:bg-white/15" />
+            </>
+          )}
           <Btn
             label={ui.collab.mode === "off" ? "Collabora" : `Collaborazione: ${ui.collab.peers.length + 1} ${ui.collab.peers.length ? "persone" : "persona"}`}
             active={ui.collab.mode !== "off"}
@@ -151,19 +156,42 @@ export default function WhiteBoard() {
               )}
             </span>
           </Btn>
-          <ViewMenu wb={wb} ui={ui} />
+          {!readOnly && <ViewMenu wb={wb} ui={ui} />}
           <FileMenu wb={wb} ui={ui} onImport={() => fileRef.current?.click()} onShare={() => void onShare()} />
         </div>
 
         {/* Strumenti: in alto al centro su schermi larghi, in basso altrove */}
         <div className="absolute inset-x-0 bottom-2 flex justify-center px-2 lg:bottom-auto lg:top-2">
-          <Toolbar wb={wb} ui={ui} />
+          {readOnly ? (
+            <div className={`${panel} pointer-events-auto flex items-center gap-2 py-1.5 pl-3.5 pr-1.5 text-sm`} role="status">
+              <span className="text-amber-600 dark:text-amber-400">{icons.eye}</span>
+              <span>
+                <b className="font-semibold">Sola lettura</b>
+                <span className="hidden sm:inline"> · puoi guardare e muoverti</span>
+              </span>
+              <button
+                type="button"
+                disabled={ui.collab.asked}
+                onClick={() => {
+                  wb.askEditAccess();
+                  notify("Richiesta inviata al proprietario della lavagna");
+                }}
+                className="rounded-xl bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-indigo-500 disabled:bg-black/10 disabled:text-current disabled:opacity-60 dark:disabled:bg-white/10"
+              >
+                {ui.collab.asked ? "Richiesta inviata" : "Chiedi di modificare"}
+              </button>
+            </div>
+          ) : (
+            <Toolbar wb={wb} ui={ui} />
+          )}
         </div>
 
         {/* Proprietà dello strumento / della selezione */}
-        <div className="absolute inset-x-2 bottom-[4.5rem] max-h-[45vh] overflow-y-auto md:inset-x-auto md:bottom-auto md:left-2 md:top-[4.5rem] md:max-h-[calc(100%-9rem)]">
-          <PropertiesPanel wb={wb} ui={ui} />
-        </div>
+        {!readOnly && (
+          <div className="absolute inset-x-2 bottom-[4.5rem] max-h-[45vh] overflow-y-auto md:inset-x-auto md:bottom-auto md:left-2 md:top-[4.5rem] md:max-h-[calc(100%-9rem)]">
+            <PropertiesPanel wb={wb} ui={ui} />
+          </div>
+        )}
 
         {/* Azioni sulla selezione */}
         {hasSelection && (

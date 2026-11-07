@@ -37,13 +37,17 @@ export default function LessonBar({ wb, ui }: { wb: Whiteboard; ui: UIState }) {
           <Btn label="Pagina successiva" shortcut="Pag ↓" tip="top" disabled={ui.page >= pages - 1} onClick={wb.nextPage}>
             {icons.next}
           </Btn>
-          <div className="mx-1 h-6 w-px bg-black/10 dark:bg-white/15" />
-          <Btn label="Aggiungi pagina in fondo" tip="top" onClick={wb.addPage}>
-            {icons.addPage}
-          </Btn>
-          <Btn label="Elimina questa pagina" tip="top" danger disabled={pages <= 1} onClick={removePage}>
-            {icons.trash}
-          </Btn>
+          {!ui.readOnly && (
+            <>
+              <div className="mx-1 h-6 w-px bg-black/10 dark:bg-white/15" />
+              <Btn label="Aggiungi pagina in fondo" tip="top" onClick={wb.addPage}>
+                {icons.addPage}
+              </Btn>
+              <Btn label="Elimina questa pagina" tip="top" danger disabled={pages <= 1} onClick={removePage}>
+                {icons.trash}
+              </Btn>
+            </>
+          )}
         </>
       )}
 

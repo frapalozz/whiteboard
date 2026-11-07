@@ -1,4 +1,5 @@
 import { deflate, fromBase64Url, hasStreams, inflate, toBase64Url } from "../share";
+import { parseSignedAcl, type SignedAcl } from "./acl";
 
 /**
  * Segnalazione WebRTC senza server.
@@ -30,6 +31,9 @@ export interface Invite {
   /** nome della lavagna */
   b: string;
   sdp: string;
+  /** Chiave pubblica del proprietario e permessi firmati (stanze con permessi). */
+  k?: string;
+  a?: SignedAcl;
 }
 
 /** Link della stanza: per entrare con il relay, senza codici da rimandare indietro. */
@@ -39,6 +43,8 @@ export interface RoomInvite {
   n: string;
   /** nome della lavagna */
   b: string;
+  k?: string;
+  a?: SignedAcl;
 }
 
 export type AnyInvite = ({ kind: "offer" } & Invite) | ({ kind: "room" } & RoomInvite);
@@ -81,12 +87,15 @@ export function extractCode(text: string): string {
   return (m ? m[1] : text).replace(/\s+/g, "");
 }
 
-export async function encodeInvite(inv: Invite): Promise<string> {
-  return pack({ v: 1, k: "o", ...inv });
+/** `k` è già il tipo dell'invito: la chiave del proprietario viaggia come `hk`. */
+const secFields = ({ k, a }: { k?: string; a?: SignedAcl }) => (k && a ? { hk: k, a } : {});
+
+export async function encodeInvite({ k, a, ...inv }: Invite): Promise<string> {
+  return pack({ v: 1, k: "o", ...inv, ...secFields({ k, a }) });
 }
 
-export async function encodeRoomInvite(inv: RoomInvite): Promise<string> {
-  return pack({ v: 2, k: "r", ...inv });
+export async function encodeRoomInvite({ k, a, ...inv }: RoomInvite): Promise<string> {
+  return pack({ v: 2, k: "r", ...inv, ...secFields({ k, a }) });
 }
 
 export async function encodeAnswer(a: Answer): Promise<string> {
@@ -98,7 +107,11 @@ export async function decodeInvite(text: string): Promise<AnyInvite | null> {
     const d = (await unpack(extractCode(text))) as Record<string, unknown>;
     const n = typeof d.n === "string" ? d.n.slice(0, 24) : "";
     const b = typeof d.b === "string" ? d.b.slice(0, 80) : "";
-    if (d.v === 2 && d.k === "r") return isStr(d.room, 100) ? { kind: "room", room: d.room, n, b } : null;
+    // permessi: chiave del proprietario + permessi firmati (la firma si verifica entrando)
+    const key = isStr(d.hk, 300) ? d.hk : undefined;
+    const acl = key ? (parseSignedAcl(d.a) ?? undefined) : undefined;
+    const sec = key && acl ? { k: key, a: acl } : {};
+    if (d.v === 2 && d.k === "r") return isStr(d.room, 100) ? { kind: "room", room: d.room, n, b, ...sec } : null;
     if (d.v !== 1 || d.k !== "o") return null;
     if (!isStr(d.i, 40) || !isStr(d.room, 100) || !isStr(d.s, 40) || !isSdp(d.sdp)) return null;
     return {
@@ -109,6 +122,7 @@ export async function decodeInvite(text: string): Promise<AnyInvite | null> {
       n,
       b,
       sdp: d.sdp,
+      ...sec,
     };
   } catch {
     return null;

@@ -24,7 +24,7 @@ export default function FileMenu({ wb, ui, onImport, onShare }: { wb: Whiteboard
           <MenuItem icon={icons.save} label="Esporta lavagna" hint="File .json, per backup o altri dispositivi" onClick={run(() => wb.exportJSON())} />
           <MenuItem icon={icons.open} label="Importa lavagna…" hint="Apre un file .json come nuova lavagna" onClick={run(onImport)} />
           <div className="my-1 h-px bg-black/10 dark:bg-white/10" />
-          <MenuItem icon={icons.trash} label="Svuota questa lavagna" danger disabled={!ui.hasContent} onClick={run(wb.clear)} />
+          <MenuItem icon={icons.trash} label="Svuota questa lavagna" danger disabled={!ui.hasContent || ui.readOnly} onClick={run(wb.clear)} />
         </div>
       )}
     </div>

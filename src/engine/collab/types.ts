@@ -1,4 +1,6 @@
 import type { El, GridMode } from "../types";
+import type { Access, SignedAcl } from "./acl";
+import type { IdentitySaved } from "./auth";
 
 /** Registro "ultima scrittura vince" (Lamport + id del sito come spareggio). */
 export interface Reg<T> {
@@ -34,7 +36,8 @@ export interface Batch {
 }
 
 export type Msg =
-  | { t: "hi"; room: string; site: string; name: string }
+  /** Saluto. `pk` + `sig`: chiave pubblica e firma dell'impronta DTLS del canale (vedi auth.ts). */
+  | { t: "hi"; room: string; site: string; name: string; pk?: string; sig?: string }
   | { t: "ops"; b: Batch }
   | { t: "peers"; list: Array<{ site: string; name: string }> }
   | { t: "sig"; from: string; to: string; k: "offer" | "answer"; sdp: string }
@@ -49,12 +52,27 @@ export type Msg =
   | { t: "vw"; x: number; y: number; w: number; h: number }
   /** "Fatti seguire": chi lo riceve inizia (o smette) di seguire chi lo manda. */
   | { t: "lead"; on: boolean }
+  /** Permessi della stanza, firmati dal proprietario. */
+  | { t: "acl"; a: SignedAcl }
+  /** Chi può solo guardare chiede (o smette di chiedere) di poter modificare. */
+  | { t: "ask"; on: boolean }
   | { t: "bye" };
 
 export interface PeerInfo {
   site: string;
   name: string;
   color: string;
+  /** Ha dimostrato di possedere la chiave del suo id (versioni precedenti dell'app: no). */
+  authed: boolean;
+}
+
+/** Permessi della stanza salvati con la lavagna. */
+export interface SecSaved {
+  /** Chiave pubblica del proprietario. */
+  hk: string;
+  /** Sito del proprietario (ricavato da `hk`). */
+  hs: string;
+  acl: SignedAcl;
 }
 
 /** Stato persistito con la lavagna, per riprendere la collaborazione dopo un ricaricamento. */
@@ -68,6 +86,10 @@ export interface CollabSaved {
   bg?: Reg<string>;
   grid?: Reg<GridMode>;
   pages?: Reg<number>;
+  /** Permessi della stanza (assenti nelle stanze create prima che esistessero: tutti modificano). */
+  sec?: SecSaved;
+  /** La tua identità in questa stanza (chiave privata: resta solo in questo browser). */
+  id?: IdentitySaved;
 }
 
 /** Parte dello stato osservabile dalla UI. */
@@ -91,8 +113,24 @@ export interface CollabUI {
   following: string | null;
   /** Siti dei partecipanti che chiedono di essere seguiti. */
   leaders: string[];
+  /** La stanza ha i permessi (false: creata con una versione precedente, tutti modificano). */
+  secured: boolean;
+  /** Sei il proprietario: decidi chi può modificare. */
+  owner: boolean;
+  /** Sito del proprietario. */
+  ownerSite: string;
+  /** Puoi modificare la lavagna. */
+  canEdit: boolean;
+  /** Chi entra senza un permesso personale può modificare? (null: stanza senza permessi) */
+  defaultAccess: Access | null;
+  /** Siti, tra i collegati, che possono modificare. */
+  editors: string[];
+  /** Solo per il proprietario: chi chiede di poter modificare. */
+  requests: string[];
+  /** Hai chiesto di poter modificare. */
+  asked: boolean;
 }
 
 export const MAX_ENTRIES = 200_000;
 
-export const OFF_UI: CollabUI = { mode: "off", room: "", peers: [], name: "", stun: true, relay: true, relayState: "off", site: "", color: "#4c8dff", leading: false, following: null, leaders: [] };
+export const OFF_UI: CollabUI = { mode: "off", room: "", peers: [], name: "", stun: true, relay: true, relayState: "off", site: "", color: "#4c8dff", leading: false, following: null, leaders: [], secured: false, owner: false, ownerSite: "", canEdit: true, defaultAccess: null, editors: [], requests: [], asked: false };

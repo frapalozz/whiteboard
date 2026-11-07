@@ -1,10 +1,12 @@
 import type { El, GridMode, Point, Rect } from "../types";
+import { accessOf, aclText, MAX_OVERRIDES, type Access, type Acl, type SignedAcl } from "./acl";
+import { authSupported, loadIdentity, newIdentity, sign, siteFor, verify, type Identity, type IdentitySaved } from "./auth";
 import { CollabDoc, MAX_POINTS, type Props } from "./doc";
 import { cleanName, colorFor, randomId } from "./protocol";
 import { CollabSession, webrtcSupported } from "./session";
 import { relaySupported } from "./relay";
 import { buildInviteUrl, decodeInvite, encodeRoomInvite, type AnyInvite } from "./signaling";
-import { OFF_UI, type Batch, type CollabSaved, type CollabUI, type Msg } from "./types";
+import { OFF_UI, type Batch, type CollabSaved, type CollabUI, type Msg, type SecSaved } from "./types";
 
 /** Ciò che il motore deve offrire al livello di collaborazione. */
 export interface CollabHost {
@@ -19,6 +21,8 @@ export interface CollabHost {
   setRemoteState(next: { elements?: El[]; bgColor?: string; grid?: GridMode; pages?: number; first?: boolean }): void;
   /** Mostra l'area `view` (coordinate mondo) di chi si sta seguendo. */
   followView(view: Rect): void;
+  /** I tuoi permessi sono cambiati (da modifica a sola lettura o viceversa). */
+  accessChanged(): void;
   invalidate(): void;
   emit(): void;
   persist(): void;
@@ -72,6 +76,17 @@ export class Collab {
   private leading = false;
   /** Sito del partecipante che stai seguendo. */
   private following: string | null = null;
+  /** Permessi della stanza (null: stanza creata prima dei permessi, tutti modificano). */
+  private sec: SecSaved | null = null;
+  /** La tua identità nella stanza: la forma salvata e la chiave pronta per firmare. */
+  private idSaved: IdentitySaved | null = null;
+  private idP: Promise<Identity | null> = Promise.resolve(null);
+  /** Solo il proprietario: chi ha chiesto di poter modificare. */
+  private requests = new Set<string>();
+  /** Hai chiesto di poter modificare. */
+  private asked = false;
+  /** I cambi di permessi si firmano uno alla volta (ognuno con la versione successiva). */
+  private aclQueue: Promise<void> = Promise.resolve();
 
   constructor(private host: CollabHost) {}
 
@@ -110,14 +125,24 @@ export class Collab {
   /** La lavagna corrente è cambiata: chiude la sessione precedente e (se c'è) riprende lo stato salvato. */
   load(saved: CollabSaved | undefined, elements: El[]): void {
     this.teardown();
-    if (saved) this.doc = CollabDoc.restore(saved, elements);
+    if (saved) {
+      this.doc = CollabDoc.restore(saved, elements);
+      this.sec = saved.sec ?? null;
+      this.setIdentity(saved.id ?? null);
+    }
     // con il relay si rientra nella stanza da soli (ricaricamento, pagina sospesa e riaperta dal telefono…)
     if (this.doc && this.relay && webrtcSupported() && relaySupported()) this.ensureSession();
     this.refreshUI();
   }
 
   save(): CollabSaved | undefined {
-    return this.doc?.save();
+    const d = this.doc?.save();
+    return d && { ...d, sec: this.sec ?? undefined, id: this.idSaved ?? undefined };
+  }
+
+  private setIdentity(s: IdentitySaved | null, ready?: Identity): void {
+    this.idSaved = s;
+    this.idP = ready ? Promise.resolve(ready) : s && authSupported() ? loadIdentity(s).catch(() => null) : Promise.resolve(null);
   }
 
   private teardown(): void {
@@ -136,15 +161,30 @@ export class Collab {
     this.following = null;
     if (this.presenceTimer) clearTimeout(this.presenceTimer);
     this.presenceTimer = null;
+    this.sec = null;
+    this.setIdentity(null);
+    this.requests.clear();
+    this.asked = false;
   }
 
-  /** La lavagna corrente diventa collaborativa: chi la avvia ne è l'host. */
-  startHost(name: string): Result {
+  /**
+   * La lavagna corrente diventa collaborativa: chi la avvia ne è il proprietario e decide se chi entra
+   * può modificare (`def`). I permessi si possono cambiare in qualsiasi momento, anche per singola persona.
+   */
+  async startHost(name: string, def: Access = "edit"): Promise<Result> {
     if (!webrtcSupported()) return { ok: false, error: "Questo browser non supporta WebRTC" };
+    if (!authSupported()) return { ok: false, error: "Questo browser non supporta la crittografia necessaria (serve HTTPS)" };
     if (this.doc) return { ok: true };
     this.setName(name);
-    const doc = new CollabDoc(randomId(16), randomId(), "host");
+    const { id, saved } = await newIdentity();
+    const room = randomId(16);
+    const acl: Acl = { v: 1, def, ov: {} };
+    const sig = await sign(id, aclText(room, acl));
+    if (this.doc) return { ok: true };
+    const doc = new CollabDoc(room, id.site, "host");
     this.doc = doc;
+    this.sec = { hk: id.pk, hs: id.site, acl: { acl, sig } };
+    this.setIdentity(saved, id);
     doc.local(this.host.getElements(), this.host.getProps(), undefined, true);
     this.synced = true;
     this.ensureSession();
@@ -162,13 +202,36 @@ export class Collab {
     if (!webrtcSupported()) return { ok: false, error: "Questo browser non supporta WebRTC" };
     if (inv.kind === "room" && !relaySupported()) return { ok: false, error: "Questo browser non supporta il collegamento automatico" };
     this.setName(name);
-    this.doc = new CollabDoc(inv.room, randomId(), "guest");
+    const sec = await this.secFromInvite(inv);
+    if (sec === false) return { ok: false, error: "Invito non valido: i permessi non sono firmati dal proprietario" };
+    let site = randomId();
+    if (authSupported()) {
+      const { id, saved } = await newIdentity();
+      this.setIdentity(saved, id);
+      site = id.site;
+    }
+    this.doc = new CollabDoc(inv.room, site, "guest");
+    this.sec = sec;
     return this.answer(inv, true);
+  }
+
+  /** Permessi contenuti nell'invito: null se la stanza non li ha, false se la firma non torna. */
+  private async secFromInvite(inv: AnyInvite): Promise<SecSaved | null | false> {
+    if (!inv.k || !inv.a) return null;
+    if (!authSupported() || !(await verify(inv.k, aclText(inv.room, inv.a.acl), inv.a.sig))) return false;
+    return { hk: inv.k, hs: await siteFor(inv.k), acl: inv.a };
   }
 
   /** Riconnessione a una stanza di cui questa lavagna fa già parte (stessa identità, stesso storico). */
   async resume(inv: AnyInvite, name: string): Promise<Result<{ answer: string | null }>> {
     this.setName(name);
+    // un invito più recente può portare permessi più nuovi di quelli salvati
+    const sec = await this.secFromInvite(inv);
+    const cur = this.sec;
+    if (sec && cur && sec.hk === cur.hk && sec.acl.acl.v > cur.acl.acl.v) {
+      this.sec = { ...cur, acl: sec.acl };
+      this.accessChanged();
+    }
     return this.answer(inv, false);
   }
 
@@ -212,7 +275,8 @@ export class Collab {
     if (!this.doc) return { ok: false, error: "La collaborazione non è attiva" };
     this.ensureSession();
     try {
-      return { ok: true, ...(await (this.session as CollabSession).createInvite(this.host.getBoardName())) };
+      const sec = this.sec ? { k: this.sec.hk, a: this.sec.acl } : undefined;
+      return { ok: true, ...(await (this.session as CollabSession).createInvite(this.host.getBoardName(), sec)) };
     } catch {
       return { ok: false, error: "Impossibile creare l'invito" };
     }
@@ -233,7 +297,8 @@ export class Collab {
     const doc = this.doc;
     if (!doc) return { ok: false, error: "La collaborazione non è attiva" };
     try {
-      const code = await encodeRoomInvite({ room: doc.room, n: this.effectiveName(), b: this.host.getBoardName() });
+      const sec = this.sec ? { k: this.sec.hk, a: this.sec.acl } : {};
+      const code = await encodeRoomInvite({ room: doc.room, n: this.effectiveName(), b: this.host.getBoardName(), ...sec });
       return { ok: true, url: buildInviteUrl(code) };
     } catch {
       return { ok: false, error: "Impossibile creare il link" };
@@ -282,7 +347,23 @@ export class Collab {
     const doc = this.doc;
     if (!doc || this.session) return;
     this.session = new CollabSession(
-      { room: doc.room, site: doc.site, name: this.effectiveName(), stun: this.stun, relay: this.relay && relaySupported() },
+      {
+        room: doc.room,
+        site: doc.site,
+        name: this.effectiveName(),
+        stun: this.stun,
+        relay: this.relay && relaySupported(),
+        auth: this.idSaved
+          ? {
+              pk: this.idSaved.pk,
+              sign: async (text) => {
+                const id = await this.idP;
+                if (!id) throw new Error("identità non disponibile");
+                return sign(id, text);
+              },
+            }
+          : null,
+      },
       {
         onPeerOpen: (peer) => {
           this.remotes.set(peer.site, { site: peer.site, name: peer.name, color: peer.color, cursor: null, draft: null, view: null, leading: false });
@@ -292,10 +373,14 @@ export class Collab {
           const view = this.host.getPresence().view;
           if (view) this.session?.sendTo(peer.site, { t: "vw", ...roundRect(view) });
           if (this.leading) this.session?.sendTo(peer.site, { t: "lead", on: true });
+          // i permessi più recenti che conosciamo, e la nostra richiesta se arriva il proprietario
+          if (this.sec) this.session?.sendTo(peer.site, { t: "acl", a: this.sec.acl });
+          if (this.asked && peer.site === this.sec?.hs) this.session?.sendTo(peer.site, { t: "ask", on: true });
           this.refreshUI();
         },
         onPeerClose: (site) => {
           this.remotes.delete(site);
+          this.requests.delete(site);
           if (this.following === site) this.following = null;
           this.host.invalidate();
           this.refreshUI();
@@ -314,6 +399,8 @@ export class Collab {
   localChanged(): void {
     const doc = this.doc;
     if (!doc) return;
+    // in sola lettura non si manda nulla, e ciò che è cambiato in locale torna com'era
+    if (!this.canEditSelf) return this.revert();
     let props = this.host.getProps();
     // proprietà remote non ancora applicate al motore (gesture in corso): valgono quelle del documento,
     // altrimenti i valori vecchi del motore sovrascriverebbero quelli appena arrivati
@@ -365,8 +452,11 @@ export class Collab {
     const rv = this.remotes.get(from);
     switch (msg.t) {
       case "ops": {
+        // modifiche (anche inoltrate) solo da chi può modificare e ha dimostrato chi è
+        if (!this.trusted(from)) return;
         const r = doc.apply(msg.b);
-        if (r.forward) for (const part of chunkBatch(r.forward)) this.session?.send({ t: "ops", b: part }, from);
+        // chi è in sola lettura non inoltra: gli altri non accetterebbero comunque le sue modifiche
+        if (r.forward && this.canEditSelf) for (const part of chunkBatch(r.forward)) this.session?.send({ t: "ops", b: part }, from);
         if (r.changed.size || r.props) {
           for (const id of r.changed) {
             this.pending.add(id);
@@ -383,7 +473,7 @@ export class Collab {
         this.host.invalidate();
         return;
       case "dp": {
-        if (!rv) return;
+        if (!rv || !this.trusted(from)) return;
         let d = rv.draft;
         if (!d || d.id !== msg.id || d.type !== "stroke") {
           if (msg.f !== 0) return;
@@ -396,7 +486,7 @@ export class Collab {
         return;
       }
       case "dr":
-        if (!rv) return;
+        if (!rv || !this.trusted(from)) return;
         rv.draft = msg.el;
         this.host.invalidate();
         return;
@@ -411,14 +501,132 @@ export class Collab {
         rv.view = { x: msg.x, y: msg.y, w: msg.w, h: msg.h };
         if (this.following === from) this.host.followView(rv.view);
         return;
+      case "acl":
+        void this.onAcl(msg.a, from);
+        return;
+      case "ask":
+        if (!this.isOwner || this.canEdit(from)) return;
+        if (msg.on) this.requests.add(from);
+        else this.requests.delete(from);
+        this.refreshUI();
+        return;
       case "lead":
-        if (!rv || rv.leading === msg.on) return;
+        // farsi seguire da tutti è di chi conduce: non di chi può solo guardare
+        if (!rv || rv.leading === msg.on || (msg.on && !this.trusted(from))) return;
         rv.leading = msg.on;
         if (msg.on && !this.leading) this.follow(from);
         else if (!msg.on && this.following === from) this.following = null;
         this.refreshUI();
         return;
     }
+  }
+
+  /* ---------------------------------------------------------------------
+   * Permessi: chi può modificare e chi può solo guardare
+   * ------------------------------------------------------------------- */
+
+  /** `site` può modificare? (Stanza senza permessi: tutti.) */
+  canEdit(site: string): boolean {
+    return !this.sec || accessOf(this.sec.acl.acl, this.sec.hs, site) === "edit";
+  }
+
+  /** Puoi modificare la lavagna (fuori dalla collaborazione: sempre). */
+  get canEditSelf(): boolean {
+    return !this.doc || this.canEdit(this.doc.site);
+  }
+
+  /** Sei il proprietario della stanza: solo tu firmi i permessi. */
+  private get isOwner(): boolean {
+    return !!this.sec && !!this.doc && !!this.idSaved && this.doc.site === this.sec.hs;
+  }
+
+  /** Da `from` si accettano modifiche (sue o inoltrate): può modificare e ha dimostrato la sua identità. */
+  private trusted(from: string): boolean {
+    if (!this.sec) return true;
+    return this.canEdit(from) && !!this.session?.isAuthed(from);
+  }
+
+  /** Permessi arrivati da un partecipante: valgono se firmati dal proprietario e più recenti dei nostri. */
+  private async onAcl(a: SignedAcl, from: string): Promise<void> {
+    const sec = this.sec;
+    const doc = this.doc;
+    if (!sec || !doc || a.acl.v <= sec.acl.acl.v) return;
+    if (!(await verify(sec.hk, aclText(doc.room, a.acl), a.sig))) return;
+    const cur = this.sec;
+    if (!cur || cur.hk !== sec.hk || this.doc !== doc || a.acl.v <= cur.acl.acl.v) return;
+    this.sec = { ...cur, acl: a };
+    this.session?.send({ t: "acl", a }, from);
+    this.accessChanged();
+  }
+
+  private accessChanged(): void {
+    for (const s of [...this.requests]) if (this.canEdit(s)) this.requests.delete(s);
+    if (this.canEditSelf) this.asked = false;
+    this.host.accessChanged();
+    if (!this.canEditSelf) this.revert();
+    this.host.persist();
+    this.refreshUI();
+  }
+
+  /** Riporta la lavagna allo stato condiviso (in sola lettura nessuna modifica locale resta). */
+  private revert(): void {
+    const doc = this.doc;
+    if (!doc) return;
+    const p = doc.currentProps();
+    this.pending.clear();
+    this.pendingProps = false;
+    this.host.setRemoteState({ elements: doc.materialize(), bgColor: p.bgColor, grid: p.grid, pages: p.pages });
+  }
+
+  /** Proprietario: chi entra senza un permesso personale può modificare o solo guardare. */
+  setDefaultAccess(def: Access): Promise<void> {
+    return this.updateAcl((a) => ({ ...a, def }));
+  }
+
+  /** Proprietario: dà o toglie a una persona la possibilità di modificare. */
+  setAccess(site: string, access: Access): Promise<void> {
+    if (this.sec && site === this.sec.hs) return Promise.resolve();
+    return this.updateAcl((a) => ({ ...a, ov: { ...a.ov, [site]: access } }));
+  }
+
+  private updateAcl(change: (a: Acl) => Acl): Promise<void> {
+    this.aclQueue = this.aclQueue
+      .then(async () => {
+        const sec = this.sec;
+        const doc = this.doc;
+        if (!sec || !doc || !this.isOwner) return;
+        const id = await this.idP;
+        if (!id) return;
+        const cur = sec.acl.acl;
+        const want = change(cur);
+        let ov = want.ov;
+        if (Object.keys(ov).length > MAX_OVERRIDES) {
+          // si tolgono prima i permessi personali uguali a quello di tutti (non cambiano nulla)
+          ov = Object.fromEntries(Object.entries(ov).filter(([, v]) => v !== want.def));
+          if (Object.keys(ov).length > MAX_OVERRIDES) return;
+        }
+        const next: Acl = { v: cur.v + 1, def: want.def, ov };
+        const sig = await sign(id, aclText(doc.room, next));
+        if (this.sec !== sec) return;
+        this.sec = { ...sec, acl: { acl: next, sig } };
+        this.session?.send({ t: "acl", a: this.sec.acl });
+        this.accessChanged();
+      })
+      .catch(() => {});
+    return this.aclQueue;
+  }
+
+  /** In sola lettura: chiedi al proprietario di poter modificare. */
+  askAccess(): void {
+    if (!this.doc || !this.sec || this.canEditSelf || this.asked) return;
+    this.asked = true;
+    this.session?.send({ t: "ask", on: true });
+    this.refreshUI();
+  }
+
+  /** Proprietario: ignora una richiesta (la persona resta in sola lettura). */
+  dismissRequest(site: string): void {
+    if (this.requests.delete(site)) this.refreshUI();
   }
 
   /* ---------------------------------------------------------------------
@@ -527,10 +735,11 @@ export class Collab {
 
   private refreshUI(): void {
     const d = this.doc;
+    const peers = this.session?.peerList ?? [];
     const next: CollabUI = {
       mode: d ? d.mode : "off",
       room: d?.room ?? "",
-      peers: this.session?.peerList ?? [],
+      peers,
       name: this.name,
       stun: this.stun,
       relay: this.relay,
@@ -540,6 +749,14 @@ export class Collab {
       leading: this.leading,
       following: this.following,
       leaders: [...this.remotes.values()].filter((r) => r.leading).map((r) => r.site),
+      secured: !!this.sec,
+      owner: this.isOwner,
+      ownerSite: this.sec?.hs ?? "",
+      canEdit: this.canEditSelf,
+      defaultAccess: this.sec?.acl.acl.def ?? null,
+      editors: peers.filter((p) => this.canEdit(p.site) && (!this.sec || p.authed)).map((p) => p.site),
+      requests: [...this.requests].filter((r) => peers.some((p) => p.site === r)),
+      asked: this.asked,
     };
     const p = this.ui;
     const same =
@@ -553,8 +770,16 @@ export class Collab {
       p.leading === next.leading &&
       p.following === next.following &&
       p.leaders.join() === next.leaders.join() &&
+      p.secured === next.secured &&
+      p.owner === next.owner &&
+      p.ownerSite === next.ownerSite &&
+      p.canEdit === next.canEdit &&
+      p.defaultAccess === next.defaultAccess &&
+      p.editors.join() === next.editors.join() &&
+      p.requests.join() === next.requests.join() &&
+      p.asked === next.asked &&
       p.peers.length === next.peers.length &&
-      p.peers.every((x, i) => x.site === next.peers[i].site && x.name === next.peers[i].name);
+      p.peers.every((x, i) => x.site === next.peers[i].site && x.name === next.peers[i].name && x.authed === next.peers[i].authed);
     if (same) return;
     this.ui = next;
     this.host.emit();

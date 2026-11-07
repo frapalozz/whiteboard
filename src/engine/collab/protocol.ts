@@ -1,5 +1,6 @@
 import { sanitizeColor, sanitizeElement } from "../storage";
 import { MAX_POINTS, parseBatch } from "./doc";
+import { parseSignedAcl } from "./acl";
 import type { Msg } from "./types";
 import { isNum, isObj, isStr } from "./validate";
 
@@ -22,6 +23,10 @@ export function parseMsg(raw: unknown): Msg | null {
   switch (raw.t) {
     case "hi":
       if (!isStr(raw.room, 100) || !isStr(raw.site, 40)) return null;
+      if (raw.pk !== undefined || raw.sig !== undefined) {
+        if (!isStr(raw.pk, 300) || !isStr(raw.sig, 200)) return null;
+        return { t: "hi", room: raw.room, site: raw.site, name: cleanName(raw.name), pk: raw.pk, sig: raw.sig };
+      }
       return { t: "hi", room: raw.room, site: raw.site, name: cleanName(raw.name) };
     case "ops": {
       const b = parseBatch(raw.b);
@@ -67,6 +72,12 @@ export function parseMsg(raw: unknown): Msg | null {
       return { t: "vw", x: raw.x, y: raw.y, w: raw.w, h: raw.h };
     case "lead":
       return typeof raw.on === "boolean" ? { t: "lead", on: raw.on } : null;
+    case "acl": {
+      const a = parseSignedAcl(raw.a);
+      return a ? { t: "acl", a } : null;
+    }
+    case "ask":
+      return typeof raw.on === "boolean" ? { t: "ask", on: raw.on } : null;
     case "bye":
       return { t: "bye" };
     default:

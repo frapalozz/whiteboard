@@ -121,6 +121,8 @@ export interface TextEdit {
 /** Stato osservabile dalla UI React (immutabile, sostituito a ogni cambiamento). */
 export interface UIState {
   tool: ToolId;
+  /** Lavagna condivisa in sola lettura: solo la mano, nessuna modifica. */
+  readOnly: boolean;
   color: string;
   width: number;
   fill: boolean;
