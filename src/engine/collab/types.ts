@@ -48,6 +48,12 @@ export type Msg =
   /** Forma in corso (linea, freccia, rettangolo, ellisse). */
   | { t: "dr"; el: El }
   | { t: "dend"; id: string }
+  /** Chiede il file di un'immagine (id = hash SHA-256). */
+  | { t: "ag"; id: string }
+  /** Parte `i` di `n` del file `id` (base64), tipo `m`. */
+  | { t: "ad"; id: string; m: string; i: number; n: number; d: string }
+  /** Puntatore laser: punti nuovi della scia, come coppie piatte [x0,y0,x1,y1,…]. */
+  | { t: "lz"; p: number[] }
   /** Trascinamento in corso (vedi preview.ts); `ids` vuoto: finito. */
   | { t: "mv"; ids: string[]; m?: number[]; el?: El }
   /** Area visibile in coordinate mondo: serve a chi segue questo partecipante. */

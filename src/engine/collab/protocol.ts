@@ -2,6 +2,7 @@ import { sanitizeColor, sanitizeElement } from "../storage";
 import { MAX_POINTS, parseBatch } from "./doc";
 import { parseSignedAcl } from "./acl";
 import { MAX_MOVE_IDS } from "../preview";
+import { isAssetId, MAX_ASSET_BYTES } from "../assets";
 import { isLine } from "../types";
 import type { Msg } from "./types";
 import { isNum, isObj, isStr } from "./validate";
@@ -66,6 +67,21 @@ export function parseMsg(raw: unknown): Msg | null {
       const el = sanitizeElement(raw.el);
       return el && el.type !== "stroke" && el.type !== "text" ? { t: "dr", el } : null;
     }
+    case "ag":
+      return isAssetId(raw.id) ? { t: "ag", id: raw.id } : null;
+    case "ad": {
+      if (!isAssetId(raw.id) || typeof raw.m !== "string" || !/^image\/(png|jpeg|webp|gif)$/.test(raw.m)) return null;
+      const i = raw.i;
+      const n = raw.n;
+      if (!Number.isInteger(i) || !Number.isInteger(n) || (n as number) < 1 || (n as number) > ASSET_PARTS_MAX || (i as number) < 0 || (i as number) >= (n as number)) return null;
+      if (typeof raw.d !== "string" || raw.d.length > ASSET_PART_B64 || !/^[A-Za-z0-9+/=]*$/.test(raw.d)) return null;
+      return { t: "ad", id: raw.id, m: raw.m, i: i as number, n: n as number, d: raw.d };
+    }
+    case "lz": {
+      const pts = raw.p;
+      if (!Array.isArray(pts) || pts.length % 2 !== 0 || pts.length > 4000 || !pts.every((v) => isNum(v) && Math.abs(v) < 1e8)) return null;
+      return { t: "lz", p: pts as number[] };
+    }
     case "mv": {
       if (!Array.isArray(raw.ids) || raw.ids.length > MAX_MOVE_IDS || !raw.ids.every((id) => isStr(id, 100))) return null;
       const ids = raw.ids as string[];
@@ -100,6 +116,11 @@ export function parseMsg(raw: unknown): Msg | null {
       return null;
   }
 }
+
+/** File delle immagini: parti da 192 KB (in base64 ~256 KB). */
+export const ASSET_PART = 192 * 1024;
+export const ASSET_PART_B64 = Math.ceil(ASSET_PART / 3) * 4;
+export const ASSET_PARTS_MAX = Math.ceil(MAX_ASSET_BYTES / ASSET_PART);
 
 /* ------------------------------------------------------------------------
  * Frammentazione: i canali dati hanno un limite pratico sulla dimensione del messaggio

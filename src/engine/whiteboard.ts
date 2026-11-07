@@ -35,6 +35,14 @@ import { Collab, type CollabHost } from "./collab/controller";
 import type { Access } from "./collab/acl";
 import { drawEdgeMarks, edgeMarks } from "./edges";
 import { applyMove, MAX_MOVE_IDS, type MovePreview } from "./preview";
+import { assetDataUrl, loadImage, onAssetMissing, onAssetReady, putDataUrl } from "./assets";
+import { buildPdf, type PdfImagePage } from "./pdfwriter";
+import { buildSvg } from "./svg";
+import { layeredLayout, type Dir } from "./layout";
+import { parseMermaid } from "./mermaid";
+import { isImage, isPdf, prepareImage, preparePdf, type Prepared } from "./media";
+import { AUTO_MS, deleteVersions, latestVersionTime, listVersions, loadVersion, saveVersion, type VersionMeta } from "./versions";
+import { alignOffsets, distributeOffsets, snapPoint, snapRect, type AlignKind, type Guide } from "./snap";
 import { drawElement, drawElements, drawGrid, drawPages, isDark } from "./render";
 import { buildShareUrl, SHARE_HARD_LIMIT } from "./share";
 import {
@@ -50,10 +58,12 @@ import {
   writeBoard,
   writeIndex,
 } from "./storage";
-import { isBox, isBoxType, isLine, MAX_PAGES, MAX_ZOOM, MIN_ZOOM, PAGE_GAP, PAGE_H, PAGE_STRIDE, PAGE_W, pageRect } from "./types";
+import { isBox, isBoxType, isComment, isLine, MAX_PAGES, MAX_ZOOM, MIN_ZOOM, PAGE_GAP, PAGE_H, PAGE_STRIDE, PAGE_W, pageRect } from "./types";
 import type {
   BoardMeta,
   BoxEl,
+  CommentEl,
+  ImageEl,
   BoxType,
   Camera,
   El,
@@ -70,6 +80,8 @@ import type {
 } from "./types";
 
 const HISTORY_LIMIT = 200;
+/** Distanza (px schermo) entro cui un elemento trascinato si aggancia agli altri. */
+const SNAP_PX = 6;
 /** Velocità massima dello scorrimento automatico (px schermo al secondo), con il puntatore sul bordo o oltre. */
 const AUTOPAN_MAX = 900;
 /** Raggio (px schermo) delle maniglie degli estremi e dei pulsanti "+" del collegamento rapido. */
@@ -87,7 +99,10 @@ const DEFAULT_SIZE: Record<BoxType, { w: number; h: number }> = {
   diamond: { w: 200, h: 130 },
   terminal: { w: 200, h: 80 },
   data: { w: 210, h: 100 },
+  note: { w: 200, h: 200 },
 };
+/** Colori delle note adesive. */
+export const NOTE_COLORS = ["#ffec99", "#ffc9c9", "#b2f2bb", "#a5d8ff", "#d0bfff", "#ffd8a8"];
 type Side = "top" | "right" | "bottom" | "left";
 const SIDES: Side[] = ["top", "right", "bottom", "left"];
 const SIDE_DIR: Record<Side, Point> = { top: { x: 0, y: -1 }, right: { x: 1, y: 0 }, bottom: { x: 0, y: 1 }, left: { x: -1, y: 0 } };
@@ -119,6 +134,7 @@ type Action =
       moved: boolean;
     }
   | { kind: "marquee"; pid: number; start: Point; base: Set<string> }
+  | { kind: "laser"; pid: number }
   | { kind: "textclick"; pid: number; start: Point };
 
 interface Gesture {
@@ -138,6 +154,40 @@ function isTypingTarget(t: HTMLElement | null): boolean {
     return !["range", "checkbox", "radio", "button", "color", "file", "submit"].includes(t.type);
   }
   return false;
+}
+
+export type ExportScope = "all" | "selection" | "page" | "pages";
+
+/** Annulla e ripeti non toccano i commenti: restano quelli di adesso. */
+function withComments(next: El[], current: El[]): El[] {
+  const now = current.filter(isComment);
+  if (!now.length && !next.some(isComment)) return next;
+  return [...next.filter((e) => !isComment(e)), ...now];
+}
+
+/** Lucchetto (px schermo) accanto a un elemento bloccato. */
+function drawLockBadge(ctx: CanvasRenderingContext2D, x: number, y: number): void {
+  ctx.save();
+  ctx.fillStyle = "#4c8dff";
+  ctx.beginPath();
+  ctx.arc(x, y, 9, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 1.5;
+  ctx.fillRect(x - 4, y - 1, 8, 6);
+  ctx.beginPath();
+  ctx.arc(x, y - 2, 2.6, Math.PI, 0);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** Durata della scia del puntatore laser (ms). */
+export const LASER_MS = 1000;
+export interface LaserPoint {
+  x: number;
+  y: number;
+  t: number;
 }
 
 function shallowEqual(a: object, b: object): boolean {
@@ -167,6 +217,8 @@ export class Whiteboard {
   private recentColors: string[] = [];
   /** Ultima forma scelta (il pulsante "Forme" della barra riattiva questa). */
   private lastShape: BoxType = "rect";
+  /** Colore delle nuove note adesive. */
+  private noteColor = NOTE_COLORS[0];
 
   /* ---- stato transitorio ---- */
   /** Forma evidenziata a cui si aggancerà l'estremo che si sta disegnando o trascinando. */
@@ -226,6 +278,9 @@ export class Whiteboard {
   constructor() {
     this.collab = new Collab(this.makeCollabHost());
     this.snapshot = this.buildSnapshot();
+    // immagini: si ridisegna quando un file è pronto; quelli che mancano si chiedono agli altri
+    onAssetReady(() => this.requestRender());
+    onAssetMissing((id) => this.collab.wantAsset(id));
   }
 
   /* ======================================================================
@@ -257,7 +312,7 @@ export class Whiteboard {
       if (sel.length) {
         if (sel.every((e) => e.color === sel[0].color)) color = sel[0].color;
         if (sel.every((e) => e.width === sel[0].width)) width = sel[0].width;
-        const boxes = sel.filter(isBox);
+        const boxes = sel.filter((e) => isBox(e) && e.type !== "note") as BoxEl[];
         if (boxes.length) {
           hasBox = true;
           if (boxes.every((b) => b.fill === boxes[0].fill)) fill = boxes[0].fill;
@@ -269,7 +324,7 @@ export class Whiteboard {
     let selShape: BoxType | null = null;
     if (this.selection.size) {
       const sel = this.selectedElements();
-      if (sel.length && sel.every((e) => e.type === sel[0].type) && isBox(sel[0])) selShape = sel[0].type;
+      if (sel.length && sel.every((e) => e.type === sel[0].type) && isBox(sel[0]) && sel[0].type !== "note") selShape = sel[0].type;
     }
     return {
       tool: this.tool,
@@ -283,7 +338,15 @@ export class Whiteboard {
       canUndo: this.past.length > 0,
       canRedo: this.future.length > 0,
       selectionCount: this.selection.size,
-      showFill: isBoxType(this.tool) || hasBox,
+      showFill: (isBoxType(this.tool) && this.tool !== "note") || hasBox,
+      noteColor: this.selectedNoteColor(),
+      showNoteColors: this.tool === "note" || this.selectedElements().some((e) => e.type === "note"),
+      onlyNotes: this.selection.size ? this.selectedElements().every((e) => e.type === "note") : this.tool === "note",
+      lockState: this.lockState(),
+      hasLocked: this.elements.some((e) => e.locked),
+      canArrange: this.selection.size > 1 && this.canArrange(),
+      comment: this.commentUI(),
+      task: this.task,
       lastShape: this.lastShape,
       selShape,
       hasContent: this.elements.length > 0,
@@ -340,6 +403,9 @@ export class Whiteboard {
     canvas.addEventListener("dblclick", this.onDoubleClick);
     canvas.addEventListener("contextmenu", this.onContextMenu);
     canvas.addEventListener("mousedown", this.onMouseDown);
+    canvas.addEventListener("dragover", this.onDragOver);
+    canvas.addEventListener("drop", this.onDrop);
+    window.addEventListener("paste", this.onPaste);
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
     window.addEventListener("blur", this.onWindowBlur);
@@ -363,6 +429,9 @@ export class Whiteboard {
       canvas.removeEventListener("dblclick", this.onDoubleClick);
       canvas.removeEventListener("contextmenu", this.onContextMenu);
       canvas.removeEventListener("mousedown", this.onMouseDown);
+      canvas.removeEventListener("dragover", this.onDragOver);
+      canvas.removeEventListener("drop", this.onDrop);
+      window.removeEventListener("paste", this.onPaste);
       window.removeEventListener("keydown", this.onKeyDown);
       window.removeEventListener("keyup", this.onKeyUp);
       window.removeEventListener("blur", this.onWindowBlur);
@@ -466,6 +535,7 @@ export class Whiteboard {
 
   private drawOverlay(ctx: CanvasRenderingContext2D): void {
     const accent = "#4c8dff";
+    this.drawPins(ctx);
     const showSel = this.selection.size > 0 && !this.editing && this.draft === null;
 
     if (showSel) {
@@ -493,13 +563,22 @@ export class Whiteboard {
         ctx.setLineDash([]);
         ctx.fillStyle = "#ffffff";
         ctx.lineWidth = 1.5;
-        for (const hd of HANDLES) {
-          const hp = this.handleScreenPos(sb, hd);
-          ctx.beginPath();
-          ctx.rect(hp.x - 4.5, hp.y - 4.5, 9, 9);
-          ctx.fill();
-          ctx.stroke();
+        if (this.lockState() === "none") {
+          for (const hd of HANDLES) {
+            const hp = this.handleScreenPos(sb, hd);
+            ctx.beginPath();
+            ctx.rect(hp.x - 4.5, hp.y - 4.5, 9, 9);
+            ctx.fill();
+            ctx.stroke();
+          }
         }
+      }
+      // lucchetto sugli elementi bloccati selezionati
+      for (const el of sel) {
+        if (!el.locked) continue;
+        const b = boundsOf(el);
+        const s = this.toScreen({ x: b.x + b.w, y: b.y });
+        drawLockBadge(ctx, s.x + 2, s.y - 2);
       }
     }
 
@@ -516,6 +595,8 @@ export class Whiteboard {
         ctx.stroke();
       }
     }
+
+    this.drawGuides(ctx);
 
     if (this.marquee) {
       const s = this.toScreen(this.marquee);
@@ -554,9 +635,63 @@ export class Whiteboard {
     }
 
     this.drawRemoteCursors(ctx);
+    // la scia svanisce da sola: si continua a ridisegnare finché ce n'è
+    if (this.drawLasers(ctx)) this.requestRender();
   }
 
   /** Cursori degli altri partecipanti, con il loro nome. */
+  /** Puntatori laser: i propri e quelli degli altri, con una scia che svanisce. */
+  private drawLasers(ctx: CanvasRenderingContext2D): boolean {
+    const now = performance.now();
+    let alive = false;
+    const trails: Point[][] = [];
+    const cut = (t: LaserPoint[]) => {
+      while (t.length && now - t[0].t > LASER_MS) t.shift();
+    };
+    cut(this.laserTrail);
+    if (this.laserTrail.length) trails.push(this.laserTrail.map((q) => this.toScreen(q)));
+    for (const r of this.collab.remote()) {
+      cut(r.laser);
+      if (r.laser.length) trails.push(r.laser.map((q) => this.toScreen(q)));
+    }
+    for (const pts of trails) {
+      alive = true;
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      for (let k = 1; k < pts.length; k++) {
+        const f = k / pts.length;
+        if (Math.hypot(pts[k].x - pts[k - 1].x, pts[k].y - pts[k - 1].y) > 400) continue; // salto tra due gesti
+        ctx.strokeStyle = `rgba(255,40,40,${0.15 + 0.75 * f})`;
+        ctx.lineWidth = 2 + 4 * f;
+        ctx.beginPath();
+        ctx.moveTo(pts[k - 1].x, pts[k - 1].y);
+        ctx.lineTo(pts[k].x, pts[k].y);
+        ctx.stroke();
+      }
+      const last = pts[pts.length - 1];
+      ctx.shadowColor = "rgba(255,0,0,0.9)";
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = "#ff2b2b";
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    // il puntino segue il mouse anche senza premere
+    if (this.tool === "laser" && this.hover && !this.action) {
+      ctx.save();
+      ctx.shadowColor = "rgba(255,0,0,0.9)";
+      ctx.shadowBlur = 10;
+      ctx.fillStyle = "#ff2b2b";
+      ctx.beginPath();
+      ctx.arc(this.hover.x, this.hover.y, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    return alive;
+  }
+
   private drawRemoteCursors(ctx: CanvasRenderingContext2D): void {
     const now = Date.now();
     for (const r of this.collab.remote()) {
@@ -604,7 +739,7 @@ export class Whiteboard {
   private singleBox(): BoxEl | null {
     if (this.selection.size !== 1 || this.tool !== "select") return null;
     const el = this.selectedElements()[0];
-    return el && isBox(el) ? el : null;
+    return el && isBox(el) && !el.locked ? el : null;
   }
 
   /** Posizioni (schermo) dei pulsanti "+" ai lati della forma selezionata. */
@@ -650,7 +785,7 @@ export class Whiteboard {
 
   private endpointAt(sp: Point): "a" | "b" | null {
     const l = this.singleLine();
-    if (!l) return null;
+    if (!l || l.locked) return null;
     if (dist(sp, this.toScreen(l.b)) <= END_HIT) return "b";
     if (dist(sp, this.toScreen(l.a)) <= END_HIT) return "a";
     return null;
@@ -730,7 +865,7 @@ export class Whiteboard {
     if (!prev) return;
     this.snapSeq.set(this.elements, this.collab.seq);
     this.future.push(this.elements);
-    this.elements = this.collab.rebase(prev, this.snapSeq.get(prev) ?? 0, this.elements);
+    this.elements = withComments(this.collab.rebase(prev, this.snapSeq.get(prev) ?? 0, this.elements), this.elements);
     this.coalesceKey = null;
     this.afterRestore();
   };
@@ -742,7 +877,7 @@ export class Whiteboard {
     if (!next) return;
     this.snapSeq.set(this.elements, this.collab.seq);
     this.past.push(this.elements);
-    this.elements = this.collab.rebase(next, this.snapSeq.get(next) ?? 0, this.elements);
+    this.elements = withComments(this.collab.rebase(next, this.snapSeq.get(next) ?? 0, this.elements), this.elements);
     this.coalesceKey = null;
     this.afterRestore();
   };
@@ -770,7 +905,7 @@ export class Whiteboard {
   private addElement(el: El): void {
     this.record();
     this.elements = [...this.elements, el];
-    this.rememberColor(el.color);
+    if (el.type !== "note" && el.type !== "image") this.rememberColor(el.color);
     this.changed();
   }
 
@@ -785,7 +920,7 @@ export class Whiteboard {
   private mutateSelection(fn: (el: El) => El, key?: string): void {
     if (this.selection.size === 0 || this.readOnly) return;
     this.record(this.elements, key);
-    this.elements = this.elements.map((el) => (this.selection.has(el.id) ? fn(el) : el));
+    this.elements = this.elements.map((el) => (this.selection.has(el.id) && !el.locked ? fn(el) : el));
     this.changed();
   }
 
@@ -795,12 +930,12 @@ export class Whiteboard {
 
   setTool = (tool: ToolId): void => {
     // in sola lettura c'è solo la mano
-    if (this.readOnly && tool !== "hand") {
+    if (this.readOnly && tool !== "hand" && tool !== "laser") {
       this.emit();
       return;
     }
     if (this.editing) this.finishEdit();
-    if (isBoxType(tool)) this.lastShape = tool;
+    if (isBoxType(tool) && tool !== "note") this.lastShape = tool;
     if (this.tool === tool) {
       this.emit();
       return;
@@ -814,7 +949,7 @@ export class Whiteboard {
 
   setColor = (color: string): void => {
     this.style.color = color;
-    this.mutateSelection((el) => ({ ...el, color }), "color");
+    this.mutateSelection((el) => (el.type === "note" ? el : { ...el, color }), "color");
     if (!this.selection.size) this.requestRender();
     this.scheduleSave();
     this.emit();
@@ -843,11 +978,62 @@ export class Whiteboard {
   setShape = (type: BoxType): void => {
     if (this.readOnly) return;
     this.lastShape = type;
-    if (!this.selectedElements().some(isBox)) {
+    if (!this.selectedElements().some((e) => isBox(e) && e.type !== "note")) {
       this.emit();
       return;
     }
-    this.mutateSelection((el) => (isBox(el) ? { ...el, type } : el));
+    this.mutateSelection((el) => (isBox(el) && el.type !== "note" ? { ...el, type } : el));
+  };
+
+  /* ---- note adesive ---- */
+
+  private selectedNoteColor(): string {
+    const notes = this.selectedElements().filter((e) => e.type === "note");
+    return notes.length && notes.every((n) => n.color === notes[0].color) ? notes[0].color : this.noteColor;
+  }
+
+  /** Colore delle note: quello delle nuove e, se ce ne sono di selezionate, il loro. */
+  setNoteColor = (color: string): void => {
+    this.noteColor = sanitizeColor(color, NOTE_COLORS[0]);
+    this.mutateSelection((el) => (el.type === "note" ? { ...el, color: this.noteColor } : el), "notecolor");
+    this.emit();
+  };
+
+  /* ---- blocca / sblocca ---- */
+
+  /** "none": niente di bloccato nella selezione, "all": tutto bloccato, "some": in parte. */
+  private lockState(): "none" | "some" | "all" {
+    const sel = this.selectedElements();
+    const n = sel.filter((e) => e.locked).length;
+    return n === 0 ? "none" : n === sel.length ? "all" : "some";
+  }
+
+  /** Blocca la selezione (o la sblocca, se è tutta bloccata). */
+  toggleLock = (): void => {
+    if (this.readOnly || this.selection.size === 0) return;
+    const lock = this.lockState() !== "all";
+    this.record();
+    this.elements = this.elements.map((el) => {
+      if (!this.selection.has(el.id) || el.type === "comment" || !!el.locked === lock) return el;
+      if (lock) return { ...el, locked: true as const };
+      const next = { ...el };
+      delete next.locked;
+      return next;
+    });
+    this.changed();
+  };
+
+  /** Sblocca tutti gli elementi bloccati della lavagna. */
+  unlockAll = (): void => {
+    if (this.readOnly || !this.elements.some((e) => e.locked)) return;
+    this.record();
+    this.elements = this.elements.map((el) => {
+      if (!el.locked) return el;
+      const next = { ...el };
+      delete next.locked;
+      return next;
+    });
+    this.changed();
   };
 
   setBgColor = (color: string): void => {
@@ -881,7 +1067,7 @@ export class Whiteboard {
   selectAll = (): void => {
     if (this.editing) this.finishEdit();
     this.tool = "select";
-    this.selection = new Set(this.elements.map((e) => e.id));
+    this.selection = new Set(this.elements.filter((e) => !e.locked && e.type !== "comment").map((e) => e.id));
     this.updateCursor();
     this.requestRender();
     this.emit();
@@ -897,8 +1083,10 @@ export class Whiteboard {
   deleteSelection = (): void => {
     if (this.selection.size === 0 || this.readOnly) return;
     this.record();
-    this.elements = this.elements.filter((e) => !this.selection.has(e.id));
-    this.selection.clear();
+    const gone = new Set([...this.selection].filter((id) => !this.elements.find((e) => e.id === id)?.locked));
+    if (gone.size === 0) return;
+    this.elements = this.elements.filter((e) => !gone.has(e.id));
+    for (const id of gone) this.selection.delete(id);
     this.changed();
   };
 
@@ -1209,7 +1397,7 @@ export class Whiteboard {
    * ==================================================================== */
 
   private startTextEdit(world: Point, existing?: TextEl): void {
-    if (this.readOnly) return;
+    if (this.readOnly || existing?.locked) return;
     this.editSession++;
     if (existing) {
       this.editing = {
@@ -1307,7 +1495,7 @@ export class Whiteboard {
 
   /** Apre la textarea per scrivere l'etichetta di una forma o di una freccia. */
   private startLabelEdit(el: BoxEl | LineEl): void {
-    if (this.readOnly) return;
+    if (this.readOnly || el.locked) return;
     this.editSession++;
     let box: Rect;
     if (isLine(el)) {
@@ -1394,6 +1582,7 @@ export class Whiteboard {
       h,
       fill: this.style.fill,
     };
+    if (type === "note") Object.assign(box, { color: this.noteColor, width: 1, fill: true });
     this.addElement(box);
     this.startLabelEdit(box);
   }
@@ -1470,6 +1659,7 @@ export class Whiteboard {
   /** Annulla l'azione in corso ripristinando lo stato precedente. */
   private cancelAction(): void {
     this.stopAutoPan();
+    this.guides = [];
     this.movePreview = null;
     this.collab.ping();
     const a = this.action;
@@ -1532,6 +1722,7 @@ export class Whiteboard {
     }
     this.pointers.set(e.pointerId, p);
     this.hover = e.pointerType === "touch" ? null : p;
+    this.altKey = e.altKey;
     e.preventDefault();
 
     if (this.pointers.size >= 2) {
@@ -1544,7 +1735,22 @@ export class Whiteboard {
     const active = document.activeElement as HTMLElement | null;
     if (active && active !== document.body && active !== this.canvas) active.blur?.();
 
-    const wantsPan = e.button === 1 || e.button === 2 || this.spaceDown || this.tool === "hand" || this.readOnly;
+    // un clic su un commento lo apre (con selezione, mano, commento o in sola lettura)
+    if (e.button === 0 && !this.spaceDown && (["select", "hand", "comment", "laser"].includes(this.tool) || this.readOnly)) {
+      const pin = this.pinAt(p);
+      if (pin) {
+        this.openComment(pin.id);
+        return;
+      }
+    }
+    if (this.commentOpen || this.commentDraft) {
+      this.commentOpen = null;
+      this.commentDraft = null;
+      this.emit();
+    }
+
+    const wantsPan =
+      e.button === 1 || e.button === 2 || this.spaceDown || this.tool === "hand" || (this.readOnly && this.tool !== "laser");
     if (wantsPan) {
       this.action = { kind: "pan", pid: e.pointerId, last: p };
       this.updateCursor(p);
@@ -1571,7 +1777,8 @@ export class Whiteboard {
       case "ellipse":
       case "diamond":
       case "terminal":
-      case "data": {
+      case "data":
+      case "note": {
         const isLink = this.tool === "line" || this.tool === "arrow";
         // un collegamento che parte da dentro una forma vi resta agganciato
         const bind = isLink ? (bindTargetAt(this.elements, wp, 4 / this.camera.zoom)?.id ?? null) : null;
@@ -1586,6 +1793,17 @@ export class Whiteboard {
       }
       case "text": {
         this.action = { kind: "textclick", pid: e.pointerId, start: p };
+        break;
+      }
+      case "laser":
+        this.action = { kind: "laser", pid: e.pointerId };
+        this.laserPoint(wp);
+        break;
+      case "comment": {
+        if (this.readOnly) break;
+        // attaccato all'elemento sotto il puntatore (lo segue quando si sposta)
+        const hit = this.pick(wp, 6 / this.camera.zoom);
+        this.commentDraft = hit ? { x: wp.x, y: wp.y, target: hit.id } : { x: wp.x, y: wp.y };
         break;
       }
       case "select":
@@ -1638,7 +1856,8 @@ export class Whiteboard {
       } else if (!this.selection.has(hit.id)) {
         this.selection = new Set([hit.id]);
       }
-      this.action = { kind: "move", pid: e.pointerId, start: wp, origin: this.elements, moved: false };
+      // un elemento bloccato si seleziona (per sbloccarlo) ma non si sposta
+      if (!hit.locked) this.action = { kind: "move", pid: e.pointerId, start: wp, origin: this.elements, moved: false };
       return;
     }
 
@@ -1653,6 +1872,7 @@ export class Whiteboard {
     const p = this.screenPoint(e);
     if (e.pointerType !== "touch") this.hover = p;
     if (this.pointers.has(e.pointerId)) this.pointers.set(e.pointerId, p);
+    this.altKey = e.altKey;
     this.presenceCursor = this.toWorld(p);
     this.collab.ping();
 
@@ -1737,20 +1957,36 @@ export class Whiteboard {
       }
       case "move": {
         const wp = this.toWorld(p);
-        const dx = wp.x - a.start.x;
-        const dy = wp.y - a.start.y;
+        let dx = wp.x - a.start.x;
+        let dy = wp.y - a.start.y;
         if (!a.moved && Math.hypot(dx, dy) * this.camera.zoom < 3) break;
         a.moved = true;
+        // guide magnetiche (Alt le disattiva)
+        this.guides = [];
+        const sel = this.altKey ? null : unionRects(a.origin.filter((el) => this.selection.has(el.id) && !el.locked).map(geomBoundsOf));
+        if (sel) {
+          const sn = snapRect({ ...sel, x: sel.x + dx, y: sel.y + dy }, this.snapCandidates(), SNAP_PX / this.camera.zoom);
+          dx += sn.dx;
+          dy += sn.dy;
+          this.guides = sn.guides;
+        }
         this.elements = resolveConnectors(
-          a.origin.map((el) => (this.selection.has(el.id) ? this.detach(translateEl(el, dx, dy)) : el)),
+          a.origin.map((el) => (this.selection.has(el.id) && !el.locked ? this.detach(translateEl(el, dx, dy)) : el)),
         );
         this.setMovePreview([dx, dy]);
         break;
       }
       case "resize": {
         const wp = this.toWorld(p);
-        const tx = wp.x - a.grab.x;
-        const ty = wp.y - a.grab.y;
+        let tx = wp.x - a.grab.x;
+        let ty = wp.y - a.grab.y;
+        this.guides = [];
+        if (!this.altKey && !shiftKey) {
+          const sn = snapPoint(tx, ty, this.snapCandidates(), SNAP_PX / this.camera.zoom, a.anchor);
+          tx = sn.x;
+          ty = sn.y;
+          this.guides = sn.guides;
+        }
         const ratio = (target: number, anchor: number, corner: number) => {
           const span = corner - anchor;
           // asse senza estensione (linea orizzontale/verticale, punto): nessuna scala
@@ -1772,15 +2008,563 @@ export class Whiteboard {
         const r = rectFromPoints(a.start, wp);
         this.marquee = r;
         const next = new Set(a.base);
-        for (const el of this.elements) if (rectsIntersect(boundsOf(el), r)) next.add(el.id);
+        for (const el of this.elements) if (!el.locked && el.type !== "comment" && rectsIntersect(boundsOf(el), r)) next.add(el.id);
         this.selection = next;
         this.emit();
         break;
       }
+      case "laser":
+        this.laserPoint(this.toWorld(p));
+        break;
       case "textclick":
         break;
     }
     this.requestRender();
+  }
+
+  /* ---- cronologia delle versioni ---- */
+
+  /** Elementi dell'ultima versione salvata (per non salvarne una uguale). */
+  private versioned: El[] = [];
+  private lastVersionAt = 0;
+
+  private autoVersion(): void {
+    if (this.elements === this.versioned || Date.now() - this.lastVersionAt < AUTO_MS) return;
+    if (!this.elements.length && !this.versioned.length) return;
+    void this.snapshotVersion();
+  }
+
+  private async snapshotVersion(label?: string): Promise<VersionMeta | null> {
+    this.versioned = this.elements;
+    this.lastVersionAt = Date.now();
+    try {
+      return await saveVersion(this.boardId, this.serialize(), { label, thumb: this.makeThumb() });
+    } catch {
+      return null;
+    }
+  }
+
+  /** Versioni salvate della lavagna corrente (dalla più recente). */
+  listVersions = (): Promise<VersionMeta[]> => listVersions(this.boardId).catch(() => []);
+
+  /** Salva subito una versione, con un nome facoltativo. */
+  saveVersionNow = async (label?: string): Promise<boolean> => {
+    if (this.editing) this.finishEdit();
+    return (await this.snapshotVersion(label?.trim().slice(0, 80) || undefined)) !== null;
+  };
+
+  /**
+   * Riporta la lavagna a una versione. Prima si salva quella attuale ("Prima del ripristino"), e il
+   * ripristino si annulla con Ctrl+Z. In collaborazione arriva a tutti come una modifica normale.
+   */
+  restoreVersion = async (key: string): Promise<boolean> => {
+    if (this.readOnly) return false;
+    const v = await loadVersion(key);
+    if (!v) return false;
+    if (this.editing) this.finishEdit();
+    await this.snapshotVersion("Prima del ripristino");
+    this.record();
+    this.elements = withComments(v.elements.filter((e) => !isComment(e)), this.elements);
+    if (v.bgColor) this.bgColor = v.bgColor;
+    if (v.grid) this.grid = v.grid;
+    this.pages = v.pages ?? 0;
+    this.selection.clear();
+    this.changed();
+    this.versioned = this.elements;
+    if (this.pages > 0) this.goToPage(0);
+    else this.fitContent();
+    return true;
+  };
+
+  /* ---- diagrammi da Mermaid e disposizione automatica ---- */
+
+  /** Dimensioni di una forma perché la sua etichetta ci stia comoda. */
+  private sizeForLabel(type: BoxType, label: string): { w: number; h: number } {
+    const { lines, w } = wrapText(label || " ", 220, LABEL_SIZE);
+    let bw = Math.max(140, Math.min(260, w + 44));
+    let bh = Math.max(70, lines.length * LABEL_LINE + 36);
+    if (type === "diamond") {
+      bw = Math.max(170, bw * 1.45);
+      bh = Math.max(110, bh * 1.6);
+    } else if (type === "ellipse") {
+      bw *= 1.25;
+      bh *= 1.3;
+    } else if (type === "data") {
+      bw += 40;
+    }
+    return { w: Math.round(bw), h: Math.round(bh) };
+  }
+
+  /** Crea un diagramma da testo Mermaid (flowchart), disposto in automatico al centro della vista. */
+  importMermaid = (text: string): { ok: boolean; error?: string; count?: number } => {
+    if (this.readOnly) return { ok: false, error: "Sei in sola lettura" };
+    const g = parseMermaid(text);
+    if (!g) return { ok: false, error: "Non trovo un diagramma: scrivi per esempio «flowchart TD» e poi «A --> B»" };
+    if (g.nodes.length > 500) return { ok: false, error: "Diagramma troppo grande (massimo 500 nodi)" };
+    const ids = new Map<string, string>();
+    const boxes: BoxEl[] = g.nodes.map((n) => {
+      const id = newId();
+      ids.set(n.id, id);
+      const { w, h } = this.sizeForLabel(n.shape, n.label);
+      const box: BoxEl = { id, type: n.shape, color: this.style.color, width: Math.min(this.style.width, 6), x: 0, y: 0, w, h, fill: false };
+      if (n.label.trim()) box.label = n.label;
+      return box;
+    });
+    const pos = layeredLayout(
+      boxes.map((b) => ({ id: b.id, w: b.w, h: b.h })),
+      g.edges.map((e) => ({ from: ids.get(e.from)!, to: ids.get(e.to)! })),
+      g.dir,
+    );
+    const bounds = unionRects(boxes.map((b) => ({ ...b, ...pos.get(b.id)! })))!;
+    const v = this.visibleRect();
+    const ox = v.x + v.w / 2 - bounds.w / 2 - bounds.x;
+    const oy = v.y + v.h / 2 - bounds.h / 2 - bounds.y;
+    for (const b of boxes) {
+      const p = pos.get(b.id)!;
+      b.x = p.x + ox;
+      b.y = p.y + oy;
+    }
+    const byId = new Map(boxes.map((b) => [b.id, b]));
+    const lines: LineEl[] = g.edges.map((e) => {
+      const a = byId.get(ids.get(e.from)!)!;
+      const b = byId.get(ids.get(e.to)!)!;
+      const line: LineEl = {
+        id: newId(),
+        type: e.arrow ? "arrow" : "line",
+        color: this.style.color,
+        width: Math.min(this.style.width, 6),
+        a: { x: a.x + a.w / 2, y: a.y + a.h / 2 },
+        b: { x: b.x + b.w / 2, y: b.y + b.h / 2 },
+        from: a.id,
+        to: b.id,
+      };
+      if (e.label) line.label = e.label;
+      return line;
+    });
+    this.record();
+    // prima le frecce, sotto le forme
+    this.elements = [...this.elements, ...lines, ...boxes];
+    this.tool = "select";
+    this.selection = new Set([...boxes, ...lines].map((e) => e.id));
+    this.updateCursor();
+    this.changed();
+    this.showRect(inflate(unionRects(boxes.map(geomBoundsOf))!, 40), this.pagePadding());
+    return { ok: true, count: boxes.length };
+  };
+
+  /** Si può riordinare la selezione: almeno due forme. */
+  private canArrange(): boolean {
+    return this.selectedElements().filter((e) => isBox(e) && !e.locked).length >= 2;
+  }
+
+  /**
+   * Riordina il diagramma selezionato a livelli seguendo le frecce (dall'alto in basso, o da sinistra a
+   * destra se il diagramma è più largo che alto). Resta dov'era: l'angolo in alto a sinistra non si muove.
+   */
+  autoArrange = (dir?: Dir): void => {
+    if (this.readOnly || !this.canArrange()) return;
+    const boxes = this.selectedElements().filter((e): e is BoxEl => isBox(e) && !e.locked);
+    const set = new Set(boxes.map((b) => b.id));
+    const links = this.elements.filter((e): e is LineEl => isLine(e) && !!e.from && !!e.to && set.has(e.from) && set.has(e.to));
+    const before = unionRects(boxes.map(geomBoundsOf))!;
+    const d: Dir = dir ?? (before.w > before.h * 1.6 ? "LR" : "TB");
+    const pos = layeredLayout(
+      boxes.map((b) => ({ id: b.id, w: b.w, h: b.h })),
+      links.map((l) => ({ from: l.from!, to: l.to! })),
+      d,
+    );
+    this.record();
+    this.elements = this.elements.map((el) => {
+      const p = pos.get(el.id);
+      return p && isBox(el) ? { ...el, x: before.x + p.x, y: before.y + p.y } : el;
+    });
+    this.changed();
+  };
+
+  /* ---- immagini e PDF ---- */
+
+  /** Lavoro lungo in corso (es. "Importo il PDF… 3/12"), mostrato dalla UI. */
+  private task: string | null = null;
+
+  private setTask(t: string | null): void {
+    this.task = t;
+    this.emit();
+  }
+
+  private onDragOver = (e: DragEvent): void => {
+    if (e.dataTransfer?.types.includes("Files")) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = this.readOnly ? "none" : "copy";
+    }
+  };
+
+  private onDrop = (e: DragEvent): void => {
+    const files = [...(e.dataTransfer?.files ?? [])];
+    if (!files.length) return;
+    e.preventDefault();
+    const sp = this.screenPoint(e);
+    void this.insertFiles(files, sp);
+  };
+
+  /** Incolla un'immagine (screenshot, immagine copiata). */
+  private onPaste = (e: ClipboardEvent): void => {
+    if (this.paused || isTypingTarget(e.target as HTMLElement | null)) return;
+    const files = [...(e.clipboardData?.files ?? [])].filter((f) => isImage(f) || isPdf(f));
+    if (!files.length) return;
+    e.preventDefault();
+    void this.insertFiles(files, this.hover ?? undefined);
+  };
+
+  /**
+   * Inserisce immagini e PDF. Le immagini vanno dove sono state lasciate (o al centro della vista); ogni
+   * pagina di un PDF va su una pagina della modalità lezione, bloccata, così ci si scrive sopra senza
+   * spostarla per sbaglio.
+   */
+  insertFiles = async (files: File[], at?: Point): Promise<{ ok: boolean; error?: string }> => {
+    if (this.readOnly) return { ok: false, error: "Sei in sola lettura" };
+    const images = files.filter(isImage);
+    const pdfs = files.filter(isPdf);
+    if (!images.length && !pdfs.length) return { ok: false, error: "Formato non supportato: usa immagini o PDF" };
+    try {
+      if (images.length) {
+        this.setTask(images.length > 1 ? `Inserisco ${images.length} immagini…` : "Inserisco l'immagine…");
+        const ready: Prepared[] = [];
+        for (const f of images) ready.push(await prepareImage(f));
+        this.placeImages(ready, at ? this.toWorld(at) : null);
+      }
+      for (const f of pdfs) {
+        this.setTask("Apro il PDF…");
+        const pages = await preparePdf(f, (n, tot) => this.setTask(`Importo il PDF… ${n}/${tot}`));
+        if (pages.length) this.placePdf(pages);
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : "Impossibile inserire il file" };
+    } finally {
+      this.setTask(null);
+    }
+  };
+
+  private placeImages(list: Prepared[], at: Point | null): void {
+    if (!list.length || this.readOnly) return;
+    const v = this.visibleRect();
+    const maxW = Math.min(1600, v.w * 0.6);
+    const maxH = v.h * 0.6;
+    const sized = list.map((p) => {
+      const k = Math.min(1, maxW / p.w, maxH / p.h);
+      return { ...p, sw: p.w * k, sh: p.h * k };
+    });
+    const gap = 24 / this.camera.zoom;
+    const total = sized.reduce((t, s) => t + s.sw, 0) + gap * (sized.length - 1);
+    const c = at ?? { x: v.x + v.w / 2, y: v.y + v.h / 2 };
+    let x = c.x - total / 2;
+    const els: ImageEl[] = sized.map((s) => {
+      const el: ImageEl = { id: newId(), type: "image", color: "#000000", width: 1, x, y: c.y - s.sh / 2, w: s.sw, h: s.sh, src: s.id };
+      x += s.sw + gap;
+      return el;
+    });
+    this.record();
+    this.elements = [...this.elements, ...els];
+    this.tool = "select";
+    this.selection = new Set(els.map((e) => e.id));
+    this.updateCursor();
+    this.changed();
+  }
+
+  /** Una pagina del PDF per ogni pagina della lezione, dopo l'ultima già usata. */
+  private placePdf(pages: Prepared[]): void {
+    if (this.readOnly) return;
+    let start = 0;
+    if (this.elements.length) {
+      let last = -1;
+      for (const el of this.elements) if (!isComment(el)) last = Math.max(last, this.pageOf(el));
+      start = last + 1;
+    }
+    const els: ImageEl[] = pages.map((p, i) => {
+      const r = pageRect(start + i);
+      const k = Math.min(r.w / p.w, r.h / p.h);
+      const w = p.w * k;
+      const h = p.h * k;
+      return { id: newId(), type: "image", color: "#000000", width: 1, locked: true, x: r.x + (r.w - w) / 2, y: r.y + (r.h - h) / 2, w, h, src: p.id };
+    });
+    this.record();
+    this.elements = [...this.elements, ...els];
+    this.pages = Math.min(MAX_PAGES, Math.max(this.pages, start + pages.length));
+    this.selection.clear();
+    this.changed();
+    this.goToPage(start);
+  }
+
+  /* ---- commenti ---- */
+
+  private commentOpen: string | null = null;
+  private commentDraft: { x: number; y: number; target?: string } | null = null;
+  private threadCache: { els: El[]; open: string; thread: CommentEl[] } | null = null;
+
+  /** Punto (mondo) dove sta il commento: segue l'elemento a cui è attaccato (se esiste ancora). */
+  private pinWorld(c: { x: number; y: number; target?: string; ox?: number; oy?: number }): Point {
+    if (c.target && c.ox !== undefined && c.oy !== undefined) {
+      const t = this.elements.find((e) => e.id === c.target);
+      if (t) {
+        const g = geomBoundsOf(t);
+        return { x: g.x + c.ox, y: g.y + c.oy };
+      }
+    }
+    return { x: c.x, y: c.y };
+  }
+
+  private rootComments(): CommentEl[] {
+    return this.elements.filter((e): e is CommentEl => isComment(e) && !e.re);
+  }
+
+  /** Discussioni mostrate: quelle aperte (le risolte solo con lo strumento commento). */
+  private visiblePins(): CommentEl[] {
+    return this.rootComments().filter((c) => !c.done || this.tool === "comment" || c.id === this.commentOpen);
+  }
+
+  private pinAt(sp: Point): CommentEl | null {
+    const pins = this.visiblePins();
+    for (let i = pins.length - 1; i >= 0; i--) {
+      const s = this.toScreen(this.pinWorld(this.commentAnchor(pins[i])));
+      if (Math.hypot(sp.x - (s.x + 12), sp.y - (s.y - 12)) <= 14) return pins[i];
+    }
+    return null;
+  }
+
+  private commentAnchor(c: CommentEl): CommentEl {
+    return c;
+  }
+
+  private drawPins(ctx: CanvasRenderingContext2D): void {
+    const pins = this.visiblePins();
+    const replies = new Map<string, number>();
+    for (const e of this.elements) if (isComment(e) && e.re) replies.set(e.re, (replies.get(e.re) ?? 0) + 1);
+    const draw = (p: Point, color: string, letter: string, faded: boolean, count: number, open: boolean) => {
+      const s = this.toScreen(p);
+      const x = s.x + 12;
+      const y = s.y - 12;
+      ctx.save();
+      ctx.globalAlpha = faded ? 0.45 : 1;
+      ctx.shadowColor = "rgba(0,0,0,0.25)";
+      ctx.shadowBlur = 6;
+      ctx.shadowOffsetY = 1;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      // goccia con la punta in basso a sinistra, sul punto commentato
+      ctx.moveTo(s.x, s.y);
+      ctx.lineTo(x - 7, y + 10);
+      ctx.arc(x, y, 12, Math.PI * 0.62, Math.PI * 0.38 + Math.PI * 2 - 0.0001);
+      ctx.closePath();
+      ctx.fill();
+      ctx.shadowColor = "transparent";
+      if (open) {
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      ctx.fillStyle = isDark(color) ? "#ffffff" : "#1f2328";
+      ctx.font = "700 12px system-ui, -apple-system, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(faded ? "✓" : letter, x, y + 0.5);
+      if (count > 0) {
+        ctx.fillStyle = "#e8458b";
+        ctx.beginPath();
+        ctx.arc(x + 10, y - 9, 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "700 9px system-ui, -apple-system, sans-serif";
+        ctx.fillText(String(Math.min(count + 1, 99)), x + 10, y - 8.5);
+      }
+      ctx.restore();
+    };
+    for (const c of pins) {
+      draw(this.pinWorld(this.commentAnchor(c)), c.color, (c.author.trim()[0] ?? "?").toUpperCase(), !!c.done, replies.get(c.id) ?? 0, c.id === this.commentOpen);
+    }
+    if (this.commentDraft) draw(this.pinWorld(this.commentDraft), this.collab.ui.color, "+", false, 0, true);
+  }
+
+  private commentUI(): UIState["comment"] {
+    const open = this.commentOpen;
+    let thread: CommentEl[] = [];
+    let anchorWorld: Point | null = null;
+    if (open) {
+      const c = this.threadCache;
+      if (c && c.els === this.elements && c.open === open) thread = c.thread;
+      else {
+        thread = this.elements
+          .filter((e): e is CommentEl => isComment(e) && (e.id === open || e.re === open))
+          .sort((a, b) => (a.re ? 1 : 0) - (b.re ? 1 : 0) || a.t - b.t);
+        this.threadCache = { els: this.elements, open, thread };
+      }
+      const root = thread.find((t) => t.id === open);
+      if (root) anchorWorld = this.pinWorld(this.commentAnchor(root));
+    } else if (this.commentDraft) {
+      anchorWorld = this.pinWorld(this.commentDraft);
+    }
+    const prev = (this.snapshot as UIState | undefined)?.comment;
+    const anchor = anchorWorld ? this.toScreen(anchorWorld) : null;
+    if (prev && prev.open === open && prev.draft === !!this.commentDraft && prev.thread === thread) {
+      if ((!anchor && !prev.anchor) || (anchor && prev.anchor && anchor.x === prev.anchor.x && anchor.y === prev.anchor.y)) return prev;
+    }
+    return { open, draft: !!this.commentDraft, thread, anchor, count: this.rootComments().filter((c) => !c.done).length };
+  }
+
+  /** Apre una discussione (null: chiude tutto). */
+  openComment = (id: string | null): void => {
+    this.commentOpen = id;
+    this.commentDraft = null;
+    this.requestRender();
+    this.emit();
+  };
+
+  /** Scrive un commento: il primo di una nuova discussione, o una risposta a quella aperta. */
+  addComment = (text: string): void => {
+    const body = text.trim().slice(0, 5000);
+    if (!body || this.readOnly) return;
+    const base = { id: newId(), type: "comment" as const, color: this.collab.ui.color, width: 1, text: body, author: this.collab.ui.name.trim() || "Io", t: Date.now() };
+    let el: CommentEl;
+    const d = this.commentDraft;
+    if (d) {
+      el = { ...base, x: d.x, y: d.y };
+      const t = d.target ? this.elements.find((e) => e.id === d.target) : undefined;
+      if (t) {
+        const g = geomBoundsOf(t);
+        el.target = t.id;
+        el.ox = d.x - g.x;
+        el.oy = d.y - g.y;
+      }
+      this.commentDraft = null;
+      this.commentOpen = el.id;
+    } else if (this.commentOpen) {
+      el = { ...base, x: 0, y: 0, re: this.commentOpen };
+    } else return;
+    this.elements = [...this.elements, el];
+    this.changed();
+  };
+
+  /** Segna una discussione come risolta (o la riapre). */
+  setCommentDone = (id: string, done: boolean): void => {
+    if (this.readOnly) return;
+    this.elements = this.elements.map((e) => {
+      if (e.id !== id || !isComment(e) || !!e.done === done) return e;
+      const next = { ...e };
+      if (done) next.done = true;
+      else delete next.done;
+      return next;
+    });
+    if (done && this.commentOpen === id) this.commentOpen = null;
+    this.changed();
+  };
+
+  /** Elimina un messaggio (il primo elimina tutta la discussione). */
+  deleteComment = (id: string): void => {
+    if (this.readOnly) return;
+    const before = this.elements.length;
+    this.elements = this.elements.filter((e) => e.id !== id && !(isComment(e) && e.re === id));
+    if (this.elements.length === before) return;
+    if (this.commentOpen === id) this.commentOpen = null;
+    this.changed();
+  };
+
+  /** Va alla discussione successiva (aperta) e la mostra. */
+  nextComment = (dir: 1 | -1 = 1): void => {
+    const roots = this.rootComments().filter((c) => !c.done);
+    if (!roots.length) return;
+    const i = roots.findIndex((c) => c.id === this.commentOpen);
+    const next = roots[(i + dir + roots.length) % roots.length];
+    const p = this.pinWorld(this.commentAnchor(next));
+    this.userCamera();
+    this.camera.x = p.x - this.viewW / 2 / this.camera.zoom;
+    this.camera.y = p.y - this.viewH / 2 / this.camera.zoom;
+    this.cameraChanged();
+    this.openComment(next.id);
+  };
+
+  /* ---- puntatore laser ---- */
+
+  private laserTrail: LaserPoint[] = [];
+  /** Punti nuovi da mandare agli altri (coppie piatte x, y). */
+  private laserOut: number[] = [];
+
+  private laserPoint(wp: Point): void {
+    this.laserTrail.push({ x: wp.x, y: wp.y, t: performance.now() });
+    if (this.laserTrail.length > 600) this.laserTrail.shift();
+    if (this.laserOut.length < 4000) this.laserOut.push(Math.round(wp.x * 10) / 10, Math.round(wp.y * 10) / 10);
+    this.collab.ping();
+  }
+
+  /* ---- guide magnetiche ---- */
+
+  private guides: Guide[] = [];
+  private altKey = false;
+  private snapCache: { key: string; sel: Set<string>; rects: Rect[] } | null = null;
+
+  /** Riquadri degli elementi visibili (non selezionati) a cui ci si può allineare. */
+  private snapCandidates(): Rect[] {
+    const v = this.visibleRect();
+    const key = `${v.x},${v.y},${v.w}`;
+    const c = this.snapCache;
+    if (c && c.key === key && c.sel === this.selection) return c.rects;
+    const view = inflate(v, v.w * 0.25);
+    const rects: Rect[] = [];
+    for (const el of this.elements) {
+      if (this.selection.has(el.id) || el.type === "comment") continue;
+      if (isLine(el) && (el.from || el.to)) continue; // i collegamenti seguono le forme
+      const r = geomBoundsOf(el);
+      if (rectsIntersect(r, view)) rects.push(r);
+      if (rects.length >= 400) break;
+    }
+    this.snapCache = { key, sel: this.selection, rects };
+    return rects;
+  }
+
+  private drawGuides(ctx: CanvasRenderingContext2D): void {
+    if (!this.guides.length) return;
+    ctx.save();
+    ctx.strokeStyle = "#e8458b";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    for (const g of this.guides) {
+      if (g.axis === "x") {
+        const a = this.toScreen({ x: g.at, y: g.from });
+        const b = this.toScreen({ x: g.at, y: g.to });
+        ctx.moveTo(Math.round(a.x) + 0.5, a.y - 8);
+        ctx.lineTo(Math.round(b.x) + 0.5, b.y + 8);
+      } else {
+        const a = this.toScreen({ x: g.from, y: g.at });
+        const b = this.toScreen({ x: g.to, y: g.at });
+        ctx.moveTo(a.x - 8, Math.round(a.y) + 0.5);
+        ctx.lineTo(b.x + 8, Math.round(b.y) + 0.5);
+      }
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /** Allinea gli elementi selezionati (bordi o centri). */
+  align = (kind: AlignKind): void => this.arrange(alignOffsets(this.arrangeable().map(geomBoundsOf), kind));
+
+  /** Distribuisce gli elementi selezionati con spazi uguali (almeno 3). */
+  distribute = (axis: "x" | "y"): void => this.arrange(distributeOffsets(this.arrangeable().map(geomBoundsOf), axis));
+
+  /** Elementi selezionati che si possono spostare (le frecce agganciate seguono le loro forme). */
+  private arrangeable(): El[] {
+    return this.selectedElements().filter((el) => !el.locked && !(isLine(el) && (el.from || el.to)));
+  }
+
+  private arrange(offsets: Array<{ dx: number; dy: number }>): void {
+    if (this.readOnly) return;
+    const els = this.arrangeable();
+    const by = new Map(els.map((el, i) => [el.id, offsets[i]]));
+    if (![...by.values()].some((o) => Math.abs(o.dx) > 1e-6 || Math.abs(o.dy) > 1e-6)) return;
+    this.record();
+    this.elements = this.elements.map((el) => {
+      const o = by.get(el.id);
+      return o ? translateEl(el, o.dx, o.dy) : el;
+    });
+    this.changed();
   }
 
   /* ---- trascinamento visibile in tempo reale agli altri partecipanti ---- */
@@ -1864,6 +2648,7 @@ export class Whiteboard {
 
   private endPointer(e: PointerEvent, cancelled: boolean): void {
     this.stopAutoPan();
+    this.guides = [];
     if (this.movePreview && this.action?.pid === e.pointerId) this.movePreview = null;
     this.pointers.delete(e.pointerId);
     if (this.pointers.size < 2 && this.gesture) {
@@ -1981,6 +2766,7 @@ export class Whiteboard {
       case "diamond":
       case "terminal":
       case "data":
+      case "note":
         return Math.max(el.w, el.h) * z >= 3;
       default:
         return true;
@@ -2025,6 +2811,7 @@ export class Whiteboard {
       h: Math.abs(dy),
       fill: this.style.fill,
     };
+    if (tool === "note") Object.assign(box, { color: this.noteColor, width: 1, fill: true });
     return box;
   }
 
@@ -2046,7 +2833,7 @@ export class Whiteboard {
       const t = i / steps;
       const p = { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
       for (const el of this.elements) {
-        if (this.erasing.has(el.id)) continue;
+        if (this.erasing.has(el.id) || el.locked || el.type === "comment") continue;
         if (rectContains(inflate(boundsOf(el), r), p) && hitTest(el, p, r)) this.erasing.add(el.id);
       }
     }
@@ -2077,7 +2864,7 @@ export class Whiteboard {
   }
 
   private handleAt(sp: Point): Handle | null {
-    if (this.selection.size === 0 || this.singleLine()) return null;
+    if (this.selection.size === 0 || this.singleLine() || this.lockState() !== "none") return null;
     const sb = this.selectionBounds();
     if (!sb) return null;
     for (const h of HANDLES) {
@@ -2106,7 +2893,15 @@ export class Whiteboard {
         case "arrow":
         case "rect":
         case "ellipse":
+        case "diamond":
+        case "terminal":
+        case "data":
+        case "note":
+        case "comment":
           c = "crosshair";
+          break;
+        case "laser":
+          c = "none";
           break;
         case "text":
           c = "text";
@@ -2259,7 +3054,7 @@ export class Whiteboard {
       }
     }
 
-    if (viewOnly && k !== "1" && k !== "escape") return;
+    if (viewOnly && k !== "1" && k !== "escape" && k !== "h" && k !== "k") return;
     const step = (e.shiftKey ? 10 : 1) / this.camera.zoom;
     switch (k) {
       case "v":
@@ -2290,6 +3085,15 @@ export class Whiteboard {
       case "d":
         this.setTool("diamond");
         break;
+      case "n":
+        this.setTool("note");
+        break;
+      case "k":
+        this.setTool("laser");
+        break;
+      case "c":
+        this.setTool("comment");
+        break;
       case "enter": {
         // Invio sulla forma (o freccia, o testo) selezionata: si scrive dentro
         if (this.selection.size !== 1) break;
@@ -2310,6 +3114,7 @@ export class Whiteboard {
         this.deleteSelection();
         break;
       case "escape":
+        if (this.commentOpen || this.commentDraft) this.openComment(null);
         this.clearSelection();
         break;
       case "arrowleft":
@@ -2481,6 +3286,13 @@ export class Whiteboard {
     const data = readBoard(meta.id);
     if (data) this.applyBoard(data, true);
     this.collab.load(data?.collab, this.elements);
+    this.versioned = this.elements;
+    this.lastVersionAt = Date.now();
+    void latestVersionTime(meta.id)
+      .then((t) => {
+        if (this.boardId === meta.id) this.lastVersionAt = t;
+      })
+      .catch(() => {});
     this.dirty = false;
     this.saveState = "saved";
     this.updateCursor();
@@ -2510,6 +3322,7 @@ export class Whiteboard {
       if (!this.persistIndex()) throw new Error("index");
       this.saveState = "saved";
       this.lastSaved = Date.now();
+      this.autoVersion();
     } catch {
       // quota superata o storage bloccato: i dati restano in memoria, la UI avvisa
       this.saveState = "error";
@@ -2617,6 +3430,7 @@ export class Whiteboard {
   deleteBoard = (id: string): void => {
     if (!this.boards.some((b) => b.id === id)) return;
     removeBoard(id);
+    void deleteVersions(id).catch(() => {});
     const rest = this.boards.filter((b) => b.id !== id);
     if (id !== this.boardId) {
       this.boards = rest;
@@ -2653,6 +3467,7 @@ export class Whiteboard {
         draft: this.draft,
         view: this.canvas ? this.visibleRect() : null,
         moving: this.movePreview,
+        laser: this.laserOut.length ? this.laserOut.splice(0) : null,
       }),
       followView: (v) => this.followView(v),
       accessChanged: () => this.onAccessChanged(),
@@ -2794,20 +3609,28 @@ export class Whiteboard {
    * Import / export
    * ==================================================================== */
 
-  private saveJSONFile(data: PersistedBoard, name: string): void {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  /** Il file .json porta con sé anche le immagini, così si apre identico altrove. */
+  private async saveJSONFile(data: PersistedBoard, name: string): Promise<void> {
+    const assets: Record<string, string> = {};
+    for (const el of data.elements) {
+      if (el.type !== "image" || assets[el.src]) continue;
+      const url = await assetDataUrl(el.src);
+      if (url) assets[el.src] = url;
+    }
+    const out = Object.keys(assets).length ? { ...data, assets } : data;
+    const blob = new Blob([JSON.stringify(out, null, 2)], { type: "application/json" });
     downloadBlob(blob, `${slugify(name)}-${timestamp()}.json`);
   }
 
   /** Esporta la lavagna corrente (o quella indicata) come file .json. */
   exportJSON = (id?: string): void => {
     if (!id || id === this.boardId) {
-      this.saveJSONFile(this.serialize(), this.boardName);
+      void this.saveJSONFile(this.serialize(), this.boardName);
       return;
     }
     const meta = this.boards.find((b) => b.id === id);
     const data = readBoard(id);
-    if (meta && data) this.saveJSONFile({ ...data, name: meta.name, collab: undefined }, meta.name);
+    if (meta && data) void this.saveJSONFile({ ...data, name: meta.name, collab: undefined }, meta.name);
   };
 
   /** Link che contiene l'intera lavagna corrente (nel fragment dell'URL, mai inviato al server). */
@@ -2836,7 +3659,11 @@ export class Whiteboard {
     const meta = this.makeMeta((board.name || fromFile || this.nextName()).slice(0, 80));
     this.boards = [...this.boards, meta];
     this.enterBoard(meta.id);
-    this.applyBoard(board, false);
+    this.applyBoard({ ...board, assets: undefined }, false);
+    // le immagini del file vanno nell'archivio (verificate: l'id è l'hash del contenuto)
+    if (board.assets) {
+      void Promise.all(Object.entries(board.assets).map(([id, url]) => putDataUrl(url, id))).then(() => this.requestRender());
+    }
     if (this.pages > 0) this.goToPage(0);
     else this.fitContent();
     this.dirty = true;
@@ -2846,28 +3673,98 @@ export class Whiteboard {
     return { ok: true, id: meta.id };
   };
 
-  /** Esporta tutto il contenuto (o la vista corrente se la lavagna è vuota) in PNG. */
+  /** Esporta tutto il contenuto in PNG (scorciatoia di exportImage). */
   exportPNG = async (): Promise<void> => {
-    const content = unionRects(this.elements.map(boundsOf));
-    const pad = 48;
-    const area: Rect = content
-      ? inflate(content, pad)
-      : { x: this.camera.x, y: this.camera.y, w: this.viewW / this.camera.zoom, h: this.viewH / this.camera.zoom };
+    await this.exportImage({ format: "png", scope: "all", background: true });
+  };
 
-    const maxSide = 8192;
-    const maxPixels = 16_000_000;
-    const scale = Math.min(2, maxSide / Math.max(area.w, area.h), Math.sqrt(maxPixels / (area.w * area.h)));
+  /** Aree da esportare (coordinate mondo), una per pagina del file. */
+  private exportAreas(scope: ExportScope): Rect[] {
+    const drawn = this.elements.filter((e) => !isComment(e));
+    switch (scope) {
+      case "selection": {
+        const b = unionRects(this.selectedElements().filter((e) => !isComment(e)).map(boundsOf));
+        return b ? [inflate(b, 24)] : [];
+      }
+      case "page":
+        return this.pageCount() > 0 ? [pageRect(this.currentPage())] : [];
+      case "pages": {
+        const n = this.pageCount();
+        return Array.from({ length: n }, (_, i) => pageRect(i));
+      }
+      case "all": {
+        const b = unionRects(drawn.map(boundsOf));
+        return b ? [inflate(b, 48)] : [this.visibleRect()];
+      }
+    }
+  }
+
+  /** Disegna l'area su una tela nuova (scala in pixel per unità mondo). */
+  private async renderArea(area: Rect, scale: number, background: boolean, grid: boolean): Promise<HTMLCanvasElement | null> {
+    const els = this.elements.filter((e) => !isComment(e) && rectsIntersect(boundsOf(e), area));
+    // le immagini devono essere pronte prima di disegnare
+    await Promise.all(els.flatMap((e) => (e.type === "image" ? [loadImage(e.src)] : [])));
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(area.w * scale));
     canvas.height = Math.max(1, Math.round(area.h * scale));
     const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.fillStyle = this.bgColor;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (!ctx) return null;
+    if (background) {
+      ctx.fillStyle = this.bgColor;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (grid) drawGrid(ctx, { x: area.x, y: area.y, zoom: scale }, canvas.width, canvas.height, this.grid, isDark(this.bgColor));
+    }
     ctx.setTransform(scale, 0, 0, scale, -area.x * scale, -area.y * scale);
-    drawElements(ctx, this.elements, null, undefined, null, 1, { bg: this.bgColor });
+    drawElements(ctx, els, null, undefined, null, 1, { bg: this.bgColor });
+    return canvas;
+  }
 
-    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
-    if (blob) downloadBlob(blob, `${slugify(this.boardName)}-${timestamp()}.png`);
+  /**
+   * Esporta in PNG, SVG o PDF: tutto il contenuto, la selezione, la pagina corrente o (solo PDF) tutte
+   * le pagine della lezione, una per foglio.
+   */
+  exportImage = async (o: { format: "png" | "svg" | "pdf"; scope: ExportScope; background: boolean }): Promise<{ ok: boolean; error?: string }> => {
+    if (this.editing) this.finishEdit();
+    const areas = this.exportAreas(o.scope);
+    if (!areas.length) return { ok: false, error: o.scope === "selection" ? "Niente di selezionato" : "Non ci sono pagine" };
+    const name = `${slugify(this.boardName)}-${timestamp()}`;
+    const onPage = o.scope === "page" || o.scope === "pages";
+    try {
+      this.setTask("Preparo l'esportazione…");
+      if (o.format === "svg") {
+        const area = areas[0];
+        const els = this.elements.filter((e) => !isComment(e) && rectsIntersect(boundsOf(e), area));
+        const images = new Map<string, string>();
+        for (const e of els) if (e.type === "image" && !images.has(e.src)) images.set(e.src, (await assetDataUrl(e.src)) ?? "");
+        const svg = buildSvg(els, area, images, o.background ? this.bgColor : null);
+        downloadBlob(new Blob([svg], { type: "image/svg+xml" }), `${name}.svg`);
+        return { ok: true };
+      }
+      if (o.format === "png") {
+        const area = areas[0];
+        const maxSide = 8192;
+        const scale = Math.min(2, maxSide / Math.max(area.w, area.h), Math.sqrt(16_000_000 / (area.w * area.h)));
+        const canvas = await this.renderArea(area, scale, o.background, onPage);
+        const blob = canvas && (await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/png")));
+        if (!blob) return { ok: false, error: "Impossibile creare l'immagine" };
+        downloadBlob(blob, `${name}.png`);
+        return { ok: true };
+      }
+      const pages: PdfImagePage[] = [];
+      for (const [i, area] of areas.entries()) {
+        this.setTask(areas.length > 1 ? `Preparo il PDF… ${i + 1}/${areas.length}` : "Preparo il PDF…");
+        const scale = Math.min(2, 2400 / Math.max(area.w, area.h));
+        // nel PDF lo sfondo c'è sempre (il JPEG non è trasparente)
+        const canvas = await this.renderArea(area, scale, true, onPage);
+        const blob = canvas && (await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/jpeg", 0.9)));
+        if (!canvas || !blob) return { ok: false, error: "Impossibile creare il PDF" };
+        const w = 842;
+        pages.push({ jpeg: new Uint8Array(await blob.arrayBuffer()), px: canvas.width, py: canvas.height, w, h: (w * area.h) / area.w });
+      }
+      downloadBlob(buildPdf(pages, this.boardName), `${name}.pdf`);
+      return { ok: true };
+    } finally {
+      this.setTask(null);
+    }
   };
 }

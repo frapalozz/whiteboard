@@ -265,6 +265,129 @@ export const icons = {
       <circle cx="18" cy="18" r="2" />
     </Svg>
   ),
+  note: (
+    <Svg>
+      <path d="M5 4h14v10l-5 6H5z" />
+      <path d="M14 20v-6h5" />
+    </Svg>
+  ),
+  laser: (
+    <Svg>
+      <circle cx="17" cy="7" r="2.5" fill="currentColor" />
+      <path d="M3 21l8-8M6.5 13.5l1 1M9.5 10.5l1 1" />
+      <path d="M12.5 11.5l2.5-2.5" />
+    </Svg>
+  ),
+  comment: (
+    <Svg>
+      <path d="M4 5h16v11H9l-5 4z" />
+      <path d="M8 9h8M8 12h5" />
+    </Svg>
+  ),
+  lock: (
+    <Svg>
+      <rect x="5" y="11" width="14" height="9" rx="2" />
+      <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+    </Svg>
+  ),
+  unlock: (
+    <Svg>
+      <rect x="5" y="11" width="14" height="9" rx="2" />
+      <path d="M8 11V8a4 4 0 0 1 7.5-2" />
+    </Svg>
+  ),
+  align: (
+    <Svg>
+      <path d="M4 3v18" />
+      <rect x="7" y="6" width="12" height="4" rx="1" />
+      <rect x="7" y="14" width="7" height="4" rx="1" />
+    </Svg>
+  ),
+  alignLeft: (
+    <Svg>
+      <path d="M4 3v18" />
+      <rect x="7" y="6" width="12" height="4" rx="1" />
+      <rect x="7" y="14" width="7" height="4" rx="1" />
+    </Svg>
+  ),
+  alignHCenter: (
+    <Svg>
+      <path d="M12 3v18" />
+      <rect x="6" y="6" width="12" height="4" rx="1" />
+      <rect x="8.5" y="14" width="7" height="4" rx="1" />
+    </Svg>
+  ),
+  alignRight: (
+    <Svg>
+      <path d="M20 3v18" />
+      <rect x="5" y="6" width="12" height="4" rx="1" />
+      <rect x="10" y="14" width="7" height="4" rx="1" />
+    </Svg>
+  ),
+  alignTop: (
+    <Svg>
+      <path d="M3 4h18" />
+      <rect x="6" y="7" width="4" height="12" rx="1" />
+      <rect x="14" y="7" width="4" height="7" rx="1" />
+    </Svg>
+  ),
+  alignVCenter: (
+    <Svg>
+      <path d="M3 12h18" />
+      <rect x="6" y="6" width="4" height="12" rx="1" />
+      <rect x="14" y="8.5" width="4" height="7" rx="1" />
+    </Svg>
+  ),
+  alignBottom: (
+    <Svg>
+      <path d="M3 20h18" />
+      <rect x="6" y="5" width="4" height="12" rx="1" />
+      <rect x="14" y="10" width="4" height="7" rx="1" />
+    </Svg>
+  ),
+  distH: (
+    <Svg>
+      <path d="M3 4v16M21 4v16" />
+      <rect x="9.5" y="7" width="5" height="10" rx="1" />
+    </Svg>
+  ),
+  distV: (
+    <Svg>
+      <path d="M4 3h16M4 21h16" />
+      <rect x="7" y="9.5" width="10" height="5" rx="1" />
+    </Svg>
+  ),
+  arrange: (
+    <Svg>
+      <rect x="9" y="3" width="6" height="4" rx="1" />
+      <rect x="3" y="17" width="6" height="4" rx="1" />
+      <rect x="15" y="17" width="6" height="4" rx="1" />
+      <path d="M12 7v5M6 17v-3h12v3M12 12v2" />
+    </Svg>
+  ),
+  history: (
+    <Svg>
+      <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+      <path d="M3 3v5h5M12 7v5l3 2" />
+    </Svg>
+  ),
+  upload: (
+    <Svg>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <circle cx="9" cy="10" r="2" />
+      <path d="M21 16l-5-5-9 9" />
+    </Svg>
+  ),
+  code: (
+    <Svg>
+      <path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16" />
+    </Svg>
+  ),
+  download: (
+    <Svg>
+      <path d="M12 4v11M7 10l5 5 5-5M5 20h14" />
+    </Svg>
+  ),
 };
 
 export type IconName = keyof typeof icons;

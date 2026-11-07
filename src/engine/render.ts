@@ -10,6 +10,7 @@ import {
   lineLabelRect,
   rectsIntersect,
 } from "./geometry";
+import { assetState, imageFor } from "./assets";
 import { isBox, PAGE_GAP, PAGE_STRIDE, pageRect, type Camera, type El, type GridMode, type Point, type Rect } from "./types";
 
 const lodCache = new WeakMap<El, { level: number; pts: Point[] }>();
@@ -174,6 +175,45 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: El, zoom = 1, opt
       ctx.stroke();
       break;
     }
+    case "note": {
+      const a = ctx.globalAlpha;
+      ctx.save();
+      ctx.shadowColor = "rgba(0,0,0,0.18)";
+      ctx.shadowBlur = 10;
+      ctx.shadowOffsetY = 3;
+      ctx.beginPath();
+      ctx.roundRect(el.x, el.y, el.w, el.h, 6);
+      ctx.fill();
+      ctx.restore();
+      ctx.globalAlpha = a;
+      break;
+    }
+    case "image": {
+      const img = imageFor(el.src);
+      if (img) {
+        ctx.drawImage(img, el.x, el.y, el.w, el.h);
+      } else {
+        // segnaposto finché il file non è pronto (o non arriva da un altro partecipante)
+        ctx.fillStyle = "rgba(128,128,128,0.12)";
+        ctx.fillRect(el.x, el.y, el.w, el.h);
+        ctx.strokeStyle = "rgba(128,128,128,0.6)";
+        ctx.lineWidth = Math.max(1, Math.min(el.w, el.h) / 150);
+        ctx.setLineDash([8, 6]);
+        ctx.strokeRect(el.x, el.y, el.w, el.h);
+        ctx.setLineDash([]);
+        const fs = Math.max(10, Math.min(28, el.w / 14));
+        ctx.font = fontOf(fs);
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = "rgba(110,110,110,0.9)";
+        const st = assetState(el.src);
+        ctx.fillText(st === "broken" ? "Immagine non leggibile" : st === "missing" ? "Immagine in arrivo…" : "Carico l'immagine…", el.x + el.w / 2, el.y + el.h / 2);
+        ctx.textAlign = "left";
+      }
+      break;
+    }
+    case "comment":
+      break;
     case "text": {
       ctx.font = fontOf(el.fontSize);
       ctx.textBaseline = "top";
@@ -188,7 +228,9 @@ export function drawElement(ctx: CanvasRenderingContext2D, el: El, zoom = 1, opt
   // etichetta dentro la forma
   if (isBox(el) && el.label && !opts.hideLabel) {
     const { lines } = labelLines(el);
-    drawLabelLines(ctx, lines, el.x + el.w / 2, el.y + el.h / 2, el.color);
+    // sulla nota il testo è scuro (o chiaro su una nota scura), come l'inchiostro sulla carta
+    const ink = el.type === "note" ? (isDark(el.color) ? "#f8f9fa" : "#1f2328") : el.color;
+    drawLabelLines(ctx, lines, el.x + el.w / 2, el.y + el.h / 2, ink);
   }
 }
 
@@ -207,7 +249,7 @@ export function drawElements(
   extra: { bg?: string; hideLabelId?: string | null } = {},
 ): void {
   for (const el of elements) {
-    if (hideId && el.id === hideId) continue;
+    if (el.type === "comment" || (hideId && el.id === hideId)) continue;
     if (view && !rectsIntersect(boundsOf(el), view)) continue;
     ctx.globalAlpha = fade && fade.has(el.id) ? 0.25 : 1;
     drawElement(ctx, el, zoom, { bg: extra.bg, hideLabel: extra.hideLabelId === el.id });

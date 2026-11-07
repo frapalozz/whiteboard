@@ -30,7 +30,7 @@ npm run typecheck
 - **Libreria di lavagne** salvata nel browser (localStorage): crea, apri, rinomina, duplica ed elimina lavagne dal
   pannello "Le mie lavagne", con anteprima (su telefono come elenco compatto). "Seleziona" permette di eliminarne più insieme. Ogni lavagna si salva da sola (contenuto, vista, sfondo) e si riapre
   com'era. Chi arriva dalla versione a lavagna singola trova il suo lavoro migrato in "Lavagna 1".
-- **Export / import**: PNG di tutto il contenuto, JSON di una lavagna (dal menu File o dalla card in libreria).
+- **Export / import**: PNG, SVG o PDF (vedi sotto), JSON di una lavagna con le sue immagini (dal menu File o dalla card in libreria).
   Importare un `.json` crea sempre una *nuova* lavagna, senza toccare quella aperta.
 - **Condivisione via link**: dal menu File, "Copia link di condivisione" crea un URL che contiene l'intera lavagna
   (elementi, sfondo, griglia, nome), compressa nel fragment `#lavagna=…` — nessun server né database. Chi apre il link
@@ -60,6 +60,28 @@ npm run typecheck
   bordo dello schermo la lavagna scorre da sola in quella direzione, più veloce quanto più ti avvicini. Ai bordi una striscia
   di pochi pixel, del colore dell'elemento e alla sua altezza (o larghezza), segnala ciò che è fuori dalla vista; se due
   elementi stanno nella stessa direzione si vede il più vicino.
+- **Guide magnetiche, allinea e distribuisci**: spostando o ridimensionando, bordi e centri si agganciano a quelli degli
+  elementi vicini e una linea rosa mostra l'allineamento (tieni premuto Alt per muoverti libero). Con più elementi selezionati,
+  "Allinea e distribuisci" li allinea (sinistra, centro, destra, alto, centro, basso) o li spazia in modo uniforme.
+- **Immagini e PDF**: trascina dentro una foto o uno screenshot, incollalo (Ctrl+V) o usa "Inserisci immagine o PDF". Le immagini
+  grandi vengono ridotte (lato lungo 2400 px). Un PDF diventa una pagina della modalità lezione per ogni foglio, già bloccata:
+  l'insegnante carica la scheda e ci scrive sopra. I file stanno in IndexedDB, una volta sola anche se usati più volte.
+- **Esporta in PNG, SVG e PDF**: tutto, la selezione, la pagina corrente o (in PDF) tutte le pagine della lezione, una per
+  foglio: il modo più semplice per mandare gli appunti. SVG e `.json` includono anche le immagini.
+- **Puntatore laser** (K): una scia rossa che svanisce in un secondo, visibile a tutti in collaborazione (anche a chi è in sola
+  lettura, che può usarlo per indicare qualcosa).
+- **Blocca**: un elemento bloccato (lucchetto nella barra della selezione) non si sposta, non si ridimensiona e non si cancella,
+  nemmeno con la gomma o "Seleziona tutto". Lo si seleziona con un clic per sbloccarlo; "Sblocca tutto" è nel menu File.
+- **Note adesive** (N): foglietti colorati con il testo che va a capo, per brainstorming e retrospettive. Si collegano con le
+  frecce come le altre forme.
+- **Diagramma da testo (Mermaid)**: dal menu File incolli un `flowchart` Mermaid (anche scritto da un'AI) e diventa un diagramma
+  di forme e frecce modificabili, già disposto a livelli. "Disponi in automatico" (nella barra della selezione) rimette in ordine
+  qualsiasi diagramma selezionato seguendo le frecce.
+- **Commenti** (C): clicca un punto o un elemento e scrivi; il segnaposto segue l'elemento quando si sposta. Si risponde nella
+  discussione, la si segna come risolta (si nasconde) o la si riapre; ‹ › passano alla discussione successiva. Annulla/ripeti
+  non toccano i commenti. In collaborazione ogni messaggio è un elemento a sé, quindi due risposte simultanee non si perdono.
+- **Cronologia versioni**: una versione ogni 10 minuti di lavoro, più quelle salvate a mano con un nome; il ripristino salva
+  prima la versione attuale e si annulla con Ctrl+Z. Le versioni restano nel browser (IndexedDB), le ultime 60 per lavagna.
 - **Interfaccia**: pannelli "vetro" chiari o scuri secondo il tema del sistema, strumenti raggruppati con tooltip e
   scorciatoie, pannello proprietà contestuale, notifiche, layout adattato a mobile e touch.
 - Supporto mouse, touch e penna (Pointer Events), schermi HiDPI, ridimensionamento finestra.
@@ -78,6 +100,9 @@ npm run typecheck
 | Invio | Scrivi nella forma, freccia o testo selezionato | Maiusc+Invio (scrivendo in una forma) | A capo |
 | Shift (mentre disegni) | Angoli a 15° / quadrato | Esc | Deseleziona / chiudi testo |
 | Pag ↓ / Pag ↑ | Pagina successiva / precedente | ← → ↑ ↓ (senza selezione) | Cambia pagina (con le pagine attive) |
+| N | Nota adesiva | K | Puntatore laser |
+| C | Commenti | Alt (trascinando) | Senza guide magnetiche |
+| Ctrl+V | Incolla anche immagini e screenshot | | |
 
 ## Architettura
 
@@ -89,10 +114,22 @@ src/engine/
   render.ts      disegno di elementi e griglia (usato anche dall'export), LOD per lo zoom-out
   storage.ts     validazione/parsing JSON, download
   share.ts       codifica/decodifica della lavagna nell'URL (formato compatto + deflate + base64url)
+  snap.ts        guide magnetiche, allinea e distribuisci
+  edges.ts       segni ai bordi per gli elementi fuori vista
+  preview.ts     anteprima dei trascinamenti condivisa in tempo reale
+  assets.ts      archivio dei file delle immagini (id = SHA-256), caricamento e cache
+  media.ts       immagini (riduzione) e PDF (pdf.js, caricato solo quando serve)
+  idb.ts         IndexedDB minimale (immagini, versioni)
+  versions.ts    cronologia delle versioni
+  svg.ts         export SVG
+  pdfwriter.ts   PDF minimo (una pagina JPEG per foglio), senza librerie
+  mermaid.ts     lettura dei flowchart Mermaid
+  layout.ts      disposizione automatica a livelli (cicli, cammino più lungo, baricentro)
   whiteboard.ts  classe Whiteboard: stato, input, strumenti, history, persistenza, export
 src/hooks/useWhiteboard.ts
 src/components/  WhiteBoard (composizione), Canvas, TextEditor, Toolbar, PropertiesPanel, ViewMenu, FileMenu,
-                 LessonBar (pagine e "segui"), BoardChip, BoardsDrawer, Toast, ui (design system)
+                 LessonBar (pagine e "segui"), BoardChip, BoardsDrawer, Toast, ui (design system),
+                 CommentPopover, Dialog, ExportDialog, MermaidDialog, VersionsDialog
 ```
 
 ### Collaborazione P2P
@@ -186,11 +223,23 @@ di quella stanza: in quel caso viene riaperta quella, senza doppioni. "Esci dall
 
 ### Dove finiscono i dati
 
-| Chiave localStorage | Contenuto |
+| Dove (localStorage, salvo dove indicato) | Contenuto |
 |---|---|
 | `whiteboard:index` | elenco lavagne (id, nome, date, anteprima) e lavagna corrente |
 | `whiteboard:board:<id>` | una lavagna: elementi, camera, sfondo, griglia, numero di pagine (e metadati di sincronizzazione se collaborativa) |
 | `whiteboard:collab` | nome visualizzato e preferenze STUN e collegamento automatico |
+| IndexedDB `whiteboard` / `assets` | i file delle immagini e delle pagine dei PDF, per hash SHA-256 |
+| IndexedDB `whiteboard` / `versions` | la cronologia delle versioni di ogni lavagna (con anteprima) |
+
+
+**PDF.** Per leggere i PDF serve pdf.js, che si scarica dalla CDN jsDelivr la prima volta che si apre un PDF (il PDF resta nel
+browser: viaggia solo il codice della libreria). Chi ospita l'app può usare una copia propria impostando `window.__PDFJS_URL`
+all'indirizzo di `pdf.min.mjs` (con `pdf.worker.min.mjs` nella stessa cartella).
+
+**Immagini in collaborazione.** Gli elementi immagine contengono solo l'id del file. Chi non ha il file lo chiede (`ag`) ai
+partecipanti collegati; chi ce l'ha lo manda a pezzi da 192 KB (`ad`), un pezzo alla volta per non bloccare modifiche e cursori.
+Chi riceve controlla che l'hash del contenuto sia proprio l'id: nessuno può spacciare un'immagine per un'altra. I link di
+condivisione non contengono immagini né commenti (per quelli c'è il file `.json`).
 
 localStorage ha un limite di pochi MB per sito: se si esaurisce, l'app continua a funzionare in memoria e lo segnala
 sotto il nome della lavagna. In quel caso esporta in `.json` ed elimina le lavagne che non servono.

@@ -4,11 +4,11 @@ import { useState } from "react";
 import { HexColorPicker } from "react-colorful";
 import { MAX_WIDTH, MIN_WIDTH, PALETTE } from "@/engine/constants";
 import { isBoxType, type BoxType, type ToolId, type UIState } from "@/engine/types";
-import type { Whiteboard } from "@/engine/whiteboard";
+import { NOTE_COLORS, type Whiteboard } from "@/engine/whiteboard";
 import { icons } from "./icons";
 import { panel, Section, Swatch, Switch, subtle } from "./ui";
 
-const DRAW_TOOLS: ToolId[] = ["pen", "eraser", "line", "arrow", "rect", "ellipse", "diamond", "terminal", "data", "text"];
+const DRAW_TOOLS: ToolId[] = ["pen", "eraser", "line", "arrow", "rect", "ellipse", "diamond", "terminal", "data", "text", "note"];
 const TITLES: Partial<Record<ToolId, string>> = {
   pen: "Penna",
   eraser: "Gomma",
@@ -20,6 +20,7 @@ const TITLES: Partial<Record<ToolId, string>> = {
   terminal: "Forme",
   data: "Forme",
   text: "Testo",
+  note: "Nota adesiva",
 };
 /** Le forme, con il loro significato nei diagrammi di flusso. */
 const SHAPE_INFO: Record<BoxType, { label: string; icon: keyof typeof icons }> = {
@@ -28,6 +29,7 @@ const SHAPE_INFO: Record<BoxType, { label: string; icon: keyof typeof icons }> =
   diamond: { label: "Decisione (sì / no)", icon: "diamond" },
   data: { label: "Dati (input / output)", icon: "data" },
   ellipse: { label: "Ellisse", icon: "ellipse" },
+  note: { label: "Nota adesiva", icon: "note" },
 };
 const SHAPE_ORDER: BoxType[] = ["terminal", "rect", "diamond", "data", "ellipse"];
 
@@ -67,13 +69,16 @@ export default function PropertiesPanel({ wb, ui, className = "" }: { wb: Whiteb
   const sizeLabel = isEraser ? "Dimensione gomma" : ui.tool === "text" ? "Dimensione testo" : "Spessore";
   const title = hasSel ? `Selezione · ${ui.selectionCount}` : (TITLES[ui.tool] ?? "");
   const customActive = !PALETTE.includes(ui.color) && !ui.recentColors.includes(ui.color);
-  const shapeTool = !hasSel && isBoxType(ui.tool);
+  const shapeTool = !hasSel && isBoxType(ui.tool) && ui.tool !== "note";
+  // solo note (strumento o selezione fatta solo di note): niente colore del tratto né spessore
+  const onlyNotes = ui.onlyNotes;
   const showShapes = shapeTool || (hasSel && ui.showFill);
   const shapeValue = hasSel ? ui.selShape : isBoxType(ui.tool) ? ui.tool : null;
   const hint =
     hasSel ? null
     : shapeTool ? "Clic: forma pronta per scriverci dentro. Trascina: dimensione a piacere."
     : ui.tool === "arrow" || ui.tool === "line" ? "Parti da una forma e arriva su un'altra: il collegamento resta attaccato."
+    : ui.tool === "note" ? "Clic per attaccare una nota e scriverci subito. Per cambiare colore, sceglilo prima o selezionala."
     : null;
 
   return (
@@ -100,7 +105,17 @@ export default function PropertiesPanel({ wb, ui, className = "" }: { wb: Whiteb
       {hint && <p className={`text-xs ${subtle} max-md:hidden`}>{hint}</p>}
       <div className={`${expanded ? "flex" : "hidden"} flex-col gap-4 max-md:mt-3 md:flex`}>
 
-      {!isEraser && (
+      {ui.showNoteColors && (
+        <Section label="Colore della nota">
+          <div className="flex flex-wrap items-center gap-2">
+            {NOTE_COLORS.map((c) => (
+              <Swatch key={c} color={c} active={ui.noteColor === c} onClick={() => wb.setNoteColor(c)} />
+            ))}
+          </div>
+        </Section>
+      )}
+
+      {!isEraser && !onlyNotes && (
         <Section label="Colore">
           <div className="flex flex-wrap items-center gap-2">
             {PALETTE.map((c) => (
@@ -132,6 +147,7 @@ export default function PropertiesPanel({ wb, ui, className = "" }: { wb: Whiteb
         </Section>
       )}
 
+      {!onlyNotes && (
       <Section label={sizeLabel}>
         <div className="flex items-center gap-1.5">
           {PRESETS.map((w) => (
@@ -166,6 +182,7 @@ export default function PropertiesPanel({ wb, ui, className = "" }: { wb: Whiteb
           <span className={`w-6 text-right text-xs tabular-nums ${subtle}`}>{ui.width}</span>
         </div>
       </Section>
+      )}
 
       {ui.showFill && <Switch label="Riempi la forma" checked={ui.fill} onChange={wb.setFill} />}
       </div>

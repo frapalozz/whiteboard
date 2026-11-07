@@ -31,14 +31,19 @@ export type ToolId =
   | "diamond"
   | "terminal"
   | "data"
-  | "text";
+  | "note"
+  | "text"
+  | "laser"
+  | "comment";
 
 /**
  * Forme "scatola": rettangolo (processo), ellisse, rombo (decisione), inizio/fine (rettangolo con
- * i lati arrotondati), dati (parallelogramma, input/output). Possono contenere un'etichetta e le
- * frecce vi si agganciano.
+ * i lati arrotondati), dati (parallelogramma, input/output), nota adesiva. Possono contenere
+ * un'etichetta e le frecce vi si agganciano.
  */
-export const BOX_TYPES = ["rect", "ellipse", "diamond", "terminal", "data"] as const;
+export const BOX_TYPES = ["rect", "ellipse", "diamond", "terminal", "data", "note"] as const;
+/** Forme del menu "Forme" (la nota adesiva ha il suo strumento). */
+export const SHAPE_TYPES = ["rect", "ellipse", "diamond", "terminal", "data"] as const;
 export type BoxType = (typeof BOX_TYPES)[number];
 const BOX_SET = new Set<string>(BOX_TYPES);
 export const isBoxType = (t: string): t is BoxType => BOX_SET.has(t);
@@ -54,6 +59,8 @@ interface BaseEl {
   color: string;
   /** Spessore del tratto in unità mondo. */
   width: number;
+  /** Bloccato: non si sposta, non si ridimensiona, non si cancella (finché non lo si sblocca). */
+  locked?: true;
 }
 
 export interface StrokeEl extends BaseEl {
@@ -83,6 +90,37 @@ export interface BoxEl extends BaseEl {
   label?: string;
 }
 
+/** Immagine (anche una pagina di un PDF). `src`: id del file nell'archivio locale (hash SHA-256). */
+export interface ImageEl extends BaseEl {
+  type: "image";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  src: string;
+}
+
+/**
+ * Commento. Il primo messaggio di una discussione ha la posizione (`x`, `y`) e lo stato `done`
+ * (risolta); se è attaccato a un elemento (`target`) segue quell'elemento, a distanza `ox`, `oy` dal suo
+ * angolo. Le risposte puntano al primo messaggio con `re`. Ogni messaggio è un elemento a sé: due risposte scritte
+ * insieme non si sovrascrivono.
+ */
+export interface CommentEl extends BaseEl {
+  type: "comment";
+  x: number;
+  y: number;
+  text: string;
+  author: string;
+  /** Data di creazione (ms). */
+  t: number;
+  re?: string;
+  target?: string;
+  ox?: number;
+  oy?: number;
+  done?: true;
+}
+
 export interface TextEl extends BaseEl {
   type: "text";
   x: number;
@@ -96,10 +134,11 @@ export interface TextEl extends BaseEl {
  * oggetto. Questo rende undo/redo (snapshot dell'array) e le cache (WeakMap)
  * corrette e a costo quasi nullo.
  */
-export type El = StrokeEl | LineEl | BoxEl | TextEl;
+export type El = StrokeEl | LineEl | BoxEl | TextEl | ImageEl | CommentEl;
 
 export const isBox = (el: El): el is BoxEl => isBoxType(el.type);
 export const isLine = (el: El): el is LineEl => el.type === "line" || el.type === "arrow";
+export const isComment = (el: El): el is CommentEl => el.type === "comment";
 
 export interface TextEdit {
   /** Identifica la sessione di editing: i commit di sessioni vecchie vengono ignorati. */
@@ -153,6 +192,27 @@ export interface UIState {
   pageCount: number;
   /** Pagina mostrata (indice da 0), calcolata dal centro della vista. */
   page: number;
+  /* note adesive e blocco */
+  noteColor: string;
+  showNoteColors: boolean;
+  /** Si stanno impostando solo note (strumento nota, o selezione di sole note). */
+  onlyNotes: boolean;
+  lockState: "none" | "some" | "all";
+  /** Nella lavagna c'è almeno un elemento bloccato. */
+  hasLocked: boolean;
+  /** La selezione contiene almeno due forme: si può disporre in automatico. */
+  canArrange: boolean;
+  /* commenti: discussione aperta (o nuova, `draft`) e dove mostrarla (px schermo) */
+  comment: {
+    open: string | null;
+    draft: boolean;
+    thread: CommentEl[];
+    anchor: Point | null;
+    /** Discussioni non risolte nella lavagna. */
+    count: number;
+  };
+  /** Lavoro lungo in corso (import di un PDF…), null se nessuno. */
+  task: string | null;
   /* collaborazione P2P */
   collab: CollabUI;
 }
@@ -181,6 +241,8 @@ export interface PersistedBoard {
   recentColors?: string[];
   /** Numero di pagine in modalità lezione (assente o 0 = lavagna infinita). */
   pages?: number;
+  /** File delle immagini (data URL per id), solo nei file .json esportati. */
+  assets?: Record<string, string>;
   /** Metadati di sincronizzazione, presenti solo se la lavagna è (o era) collaborativa. */
   collab?: CollabSaved;
 }

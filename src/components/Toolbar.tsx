@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef } from "react";
 import { isBoxType, type BoxType, type ToolId, type UIState } from "@/engine/types";
 import type { Whiteboard } from "@/engine/whiteboard";
 import { icons, type IconName } from "./icons";
@@ -24,7 +25,14 @@ const GROUPS: ToolDef[][] = [
     { id: "arrow", label: "Freccia (si aggancia alle forme)", key: "A", icon: "arrow" },
     SHAPES,
   ],
-  [{ id: "text", label: "Testo", key: "T", icon: "text" }],
+  [
+    { id: "text", label: "Testo", key: "T", icon: "text" },
+    { id: "note", label: "Nota adesiva", key: "N", icon: "note" },
+  ],
+  [
+    { id: "laser", label: "Puntatore laser", key: "K", icon: "laser" },
+    { id: "comment", label: "Commenti", key: "C", icon: "comment" },
+  ],
 ];
 
 const SHAPE_ICON: Record<BoxType, IconName> = {
@@ -33,9 +41,13 @@ const SHAPE_ICON: Record<BoxType, IconName> = {
   diamond: "diamond",
   terminal: "terminal",
   data: "data",
+  note: "note",
 };
 
-export default function Toolbar({ wb, ui }: { wb: Whiteboard; ui: UIState }) {
+const isShape = (t: ToolId) => isBoxType(t) && t !== "note";
+
+export default function Toolbar({ wb, ui, notify }: { wb: Whiteboard; ui: UIState; notify: (text: string, kind?: "ok" | "error") => void }) {
+  const fileRef = useRef<HTMLInputElement>(null);
   return (
     <div
       role="toolbar"
@@ -51,10 +63,10 @@ export default function Toolbar({ wb, ui }: { wb: Whiteboard; ui: UIState }) {
                 key="shapes"
                 label={t.label}
                 shortcut={t.key}
-                active={isBoxType(ui.tool)}
+                active={isShape(ui.tool)}
                 onClick={() => wb.setTool(ui.lastShape)}
               >
-                {icons[SHAPE_ICON[isBoxType(ui.tool) ? ui.tool : ui.lastShape]]}
+                {icons[SHAPE_ICON[isShape(ui.tool) ? (ui.tool as BoxType) : ui.lastShape]]}
               </Btn>
             ) : (
               <Btn key={t.id} label={t.label} shortcut={t.key} active={ui.tool === t.id} onClick={() => wb.setTool(t.id)}>
@@ -64,6 +76,26 @@ export default function Toolbar({ wb, ui }: { wb: Whiteboard; ui: UIState }) {
           )}
         </div>
       ))}
+      <div className="flex items-center gap-0.5">
+        <div className="mr-1 h-6 w-px shrink-0 bg-black/10 dark:bg-white/15" />
+        <Btn label="Inserisci immagine o PDF" onClick={() => fileRef.current?.click()} align="end">
+          {icons.upload}
+        </Btn>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*,application/pdf,.pdf"
+          multiple
+          hidden
+          onChange={async (e) => {
+            const files = [...(e.target.files ?? [])];
+            e.target.value = "";
+            if (!files.length) return;
+            const r = await wb.insertFiles(files);
+            if (!r.ok) notify(r.error ?? "Impossibile inserire il file", "error");
+          }}
+        />
+      </div>
     </div>
   );
 }

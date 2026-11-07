@@ -303,6 +303,11 @@ export class CollabSession {
     if (c) this.sendConn(c, msg);
   }
 
+  /** Frame in coda verso `site` (per non intasare il canale con un file grande). */
+  queued(site: string): number {
+    return this.peers.get(site)?.queue.length ?? 0;
+  }
+
   /** Chiude le connessioni. Il messaggio di congedo ha un attimo per partire. */
   leave(): void {
     if (this.dead) return;

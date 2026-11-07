@@ -9,6 +9,10 @@ import BoardChip from "./BoardChip";
 import BoardsDrawer from "./BoardsDrawer";
 import Canvas from "./Canvas";
 import CollabDialog from "./CollabDialog";
+import CommentPopover from "./CommentPopover";
+import ExportDialog from "./ExportDialog";
+import MermaidDialog from "./MermaidDialog";
+import VersionsDialog from "./VersionsDialog";
 import FileMenu from "./FileMenu";
 import LessonBar from "./LessonBar";
 import PropertiesPanel from "./PropertiesPanel";
@@ -16,7 +20,50 @@ import Toast, { type ToastMsg } from "./Toast";
 import Toolbar from "./Toolbar";
 import ViewMenu from "./ViewMenu";
 import { icons } from "./icons";
-import { Btn, panel } from "./ui";
+import { Btn, panel, usePopover } from "./ui";
+import type { AlignKind } from "@/engine/snap";
+import type { Whiteboard as Engine } from "@/engine/whiteboard";
+
+const ALIGN: Array<{ kind: AlignKind; label: string; icon: keyof typeof icons }> = [
+  { kind: "left", label: "Allinea a sinistra", icon: "alignLeft" },
+  { kind: "hcenter", label: "Centra in orizzontale", icon: "alignHCenter" },
+  { kind: "right", label: "Allinea a destra", icon: "alignRight" },
+  { kind: "top", label: "Allinea in alto", icon: "alignTop" },
+  { kind: "vcenter", label: "Centra in verticale", icon: "alignVCenter" },
+  { kind: "bottom", label: "Allinea in basso", icon: "alignBottom" },
+];
+
+/** Allinea e distribuisci la selezione. */
+function AlignMenu({ wb, count }: { wb: Engine; count: number }) {
+  const { open, setOpen, ref } = usePopover();
+  return (
+    <div ref={ref} className="relative">
+      <Btn label="Allinea e distribuisci" tip="top" active={open} onClick={() => setOpen(!open)}>
+        {icons.align}
+      </Btn>
+      {open && (
+        <div className={`${panel} animate-pop-in absolute bottom-full left-1/2 z-30 mb-2 grid -translate-x-1/2 grid-cols-4 gap-0.5 p-1.5 max-lg:bottom-auto max-lg:top-full max-lg:mb-0 max-lg:mt-2`}>
+          {ALIGN.slice(0, 3).map((a) => (
+            <Btn key={a.kind} label={a.label} tip="top" onClick={() => wb.align(a.kind)}>
+              {icons[a.icon]}
+            </Btn>
+          ))}
+          <Btn label="Distribuisci in orizzontale (almeno 3)" tip="top" disabled={count < 3} onClick={() => wb.distribute("x")}>
+            {icons.distH}
+          </Btn>
+          {ALIGN.slice(3).map((a) => (
+            <Btn key={a.kind} label={a.label} tip="top" onClick={() => wb.align(a.kind)}>
+              {icons[a.icon]}
+            </Btn>
+          ))}
+          <Btn label="Distribuisci in verticale (almeno 3)" tip="top" disabled={count < 3} onClick={() => wb.distribute("y")}>
+            {icons.distV}
+          </Btn>
+        </div>
+      )}
+    </div>
+  );
+}
 
 const TIPS_DESKTOP: Array<[string, string]> = [
   ["Disegna", "trascina con la penna"],
@@ -32,6 +79,13 @@ export default function WhiteBoard() {
   const { wb, ui } = useWhiteboard();
   const [library, setLibrary] = useState(false);
   const [collabOpen, setCollabOpen] = useState(false);
+  const [dialog, setDialog] = useState<null | "export" | "mermaid" | "versions">(null);
+  // con una finestra aperta le scorciatoie della lavagna tacciono
+  useEffect(() => {
+    if (!dialog) return;
+    wb.setPaused(true);
+    return () => wb.setPaused(false);
+  }, [dialog, wb]);
   /** Codice d'invito arrivato da un link `#collab=…`. */
   const [invite, setInvite] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
@@ -157,13 +211,16 @@ export default function WhiteBoard() {
             </span>
           </Btn>
           {!readOnly && <ViewMenu wb={wb} ui={ui} />}
-          <FileMenu wb={wb} ui={ui} onImport={() => fileRef.current?.click()} onShare={() => void onShare()} />
+          <FileMenu wb={wb} ui={ui} onImport={() => fileRef.current?.click()} onShare={() => void onShare()} onOpen={setDialog} />
         </div>
 
         {/* Strumenti: in alto al centro su schermi larghi, in basso altrove */}
         <div className="absolute inset-x-0 bottom-2 flex justify-center px-2 lg:bottom-auto lg:top-2">
           {readOnly ? (
             <div className={`${panel} pointer-events-auto flex items-center gap-2 py-1.5 pl-3.5 pr-1.5 text-sm`} role="status">
+              <Btn label="Puntatore laser" shortcut="K" active={ui.tool === "laser"} onClick={() => wb.setTool(ui.tool === "laser" ? "hand" : "laser")}>
+                {icons.laser}
+              </Btn>
               <span className="text-amber-600 dark:text-amber-400">{icons.eye}</span>
               <span>
                 <b className="font-semibold">Sola lettura</b>
@@ -182,7 +239,7 @@ export default function WhiteBoard() {
               </button>
             </div>
           ) : (
-            <Toolbar wb={wb} ui={ui} />
+            <Toolbar wb={wb} ui={ui} notify={notify} />
           )}
         </div>
 
@@ -198,6 +255,21 @@ export default function WhiteBoard() {
           <div
             className={`${panel} animate-pop-in absolute left-1/2 top-16 flex -translate-x-1/2 items-center gap-0.5 p-1.5 lg:bottom-3 lg:top-auto`}
           >
+            {ui.selectionCount > 1 && <AlignMenu wb={wb} count={ui.selectionCount} />}
+            {ui.canArrange && (
+              <Btn label="Disponi il diagramma in automatico" tip="top" onClick={() => wb.autoArrange()}>
+                {icons.arrange}
+              </Btn>
+            )}
+            <Btn
+              label={ui.lockState === "all" ? "Sblocca" : "Blocca (non si sposta né si cancella)"}
+              tip="top"
+              active={ui.lockState === "all"}
+              onClick={wb.toggleLock}
+            >
+              {ui.lockState === "all" ? icons.lock : icons.unlock}
+            </Btn>
+            <div className="mx-0.5 h-6 w-px bg-black/10 dark:bg-white/15" />
             <Btn label="Duplica" shortcut="Ctrl+D" tip="top" onClick={wb.duplicateSelection}>
               {icons.copy}
             </Btn>
@@ -271,6 +343,18 @@ export default function WhiteBoard() {
           </div>
         )}
 
+        <CommentPopover wb={wb} ui={ui} />
+
+        {/* Lavoro in corso (es. import di un PDF) */}
+        {ui.task && (
+          <div className="absolute inset-x-0 bottom-20 flex justify-center px-2 lg:bottom-6">
+            <div className={`${panel} flex items-center gap-2 px-4 py-2 text-sm`} role="status">
+              <span className="h-3 w-3 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent" />
+              {ui.task}
+            </div>
+          </div>
+        )}
+
         {/* Notifiche */}
         <div className="absolute inset-x-0 top-16 flex justify-center px-2 lg:top-[4.5rem]">
           <Toast toast={toast} onDone={clearToast} />
@@ -290,6 +374,10 @@ export default function WhiteBoard() {
           notify={notify}
         />
       )}
+
+      {dialog === "export" && <ExportDialog wb={wb} ui={ui} onClose={() => setDialog(null)} notify={notify} />}
+      {dialog === "mermaid" && <MermaidDialog wb={wb} onClose={() => setDialog(null)} notify={notify} />}
+      {dialog === "versions" && <VersionsDialog wb={wb} ui={ui} onClose={() => setDialog(null)} notify={notify} />}
 
       {library && <BoardsDrawer wb={wb} ui={ui} onClose={() => setLibrary(false)} onImport={() => fileRef.current?.click()} notify={notify} />}
 

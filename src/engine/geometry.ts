@@ -158,6 +158,7 @@ function sdTerminal(el: BoxEl, p: Point): number {
 export function insideBox(el: BoxEl, p: Point, pad = 0): boolean {
   switch (el.type) {
     case "rect":
+    case "note":
       return rectContains(inflate(el, pad), p);
     case "ellipse": {
       const rx = el.w / 2 + pad;
@@ -185,6 +186,10 @@ export function labelArea(el: BoxEl): Rect {
     case "rect":
       w = el.w - 20;
       h = el.h - 12;
+      break;
+    case "note":
+      w = el.w - 28;
+      h = el.h - 24;
       break;
     case "terminal":
       w = el.w - Math.min(el.w, el.h) * 0.6 - 8;
@@ -320,11 +325,19 @@ export function boundsOf(el: El): Rect {
     case "data":
       r = inflate({ x: el.x, y: el.y, w: el.w, h: el.h }, hw);
       break;
+    case "note":
+    case "image":
+      r = { x: el.x, y: el.y, w: el.w, h: el.h };
+      break;
     case "text": {
       const m = measureText(el.text, el.fontSize);
       r = { x: el.x, y: el.y, w: m.w, h: m.h };
       break;
     }
+    case "comment":
+      // la posizione vera dipende dall'elemento a cui è attaccato: i commenti si disegnano a parte
+      r = { x: el.x, y: el.y, w: 0, h: 0 };
+      break;
   }
   boundsCache.set(el, r);
   return r;
@@ -354,8 +367,11 @@ export function geomBoundsOf(el: El): Rect {
     case "diamond":
     case "terminal":
     case "data":
+    case "note":
+    case "image":
       return { x: el.x, y: el.y, w: el.w, h: el.h };
     case "text":
+    case "comment":
       return boundsOf(el);
   }
 }
@@ -410,8 +426,12 @@ export function hitTest(el: El, p: Point, tol: number): boolean {
       const d = dc === 0 ? Math.min(rx, ry) : Math.abs(dc - dc / q);
       return d <= hw;
     }
+    case "note":
+    case "image":
     case "text":
       return rectContains(inflate(boundsOf(el), tol), p);
+    case "comment":
+      return false;
   }
 }
 
@@ -433,8 +453,13 @@ export function translateEl(el: El, dx: number, dy: number): El {
     case "diamond":
     case "terminal":
     case "data":
+    case "note":
+    case "image":
     case "text":
       return { ...el, x: el.x + dx, y: el.y + dy };
+    case "comment":
+      // un commento attaccato a un elemento lo segue da solo
+      return el.target ? el : { ...el, x: el.x + dx, y: el.y + dy };
   }
 }
 
@@ -457,7 +482,11 @@ export function scaleEl(el: El, ox: number, oy: number, sx: number, sy: number):
     case "diamond":
     case "terminal":
     case "data":
+    case "note":
+    case "image":
       return { ...el, x: mx(el.x), y: my(el.y), w: el.w * sx, h: el.h * sy };
+    case "comment":
+      return el;
     case "text":
       return {
         ...el,

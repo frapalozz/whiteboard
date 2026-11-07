@@ -1,6 +1,7 @@
+import { isAssetId } from "./assets";
 import { GRIDS, parsePages, parseSaved } from "./collab/validate";
 import { MAX_ZOOM, MIN_ZOOM } from "./types";
-import type { BoardMeta, BoxEl, Camera, El, GridMode, LineEl, PersistedBoard, Point } from "./types";
+import type { BoardMeta, BoxEl, Camera, CommentEl, El, GridMode, LineEl, PersistedBoard, Point } from "./types";
 
 /** Chiave usata dalla versione precedente (una sola lavagna): viene migrata al primo avvio. */
 export const LEGACY_KEY = "whiteboard:v1";
@@ -34,6 +35,12 @@ export function sanitizeElement(raw: unknown): El | null {
   const color = sanitizeColor(raw.color, "#000000");
   const width = isNum(raw.width) ? Math.min(200, Math.max(0.5, raw.width)) : 4;
 
+  const el = sanitizeBody(raw, id, color, width);
+  if (el && raw.locked === true && el.type !== "comment") el.locked = true;
+  return el;
+}
+
+function sanitizeBody(raw: Record<string, unknown>, id: string, color: string, width: number): El | null {
   switch (raw.type) {
     case "stroke": {
       if (!Array.isArray(raw.points) || raw.points.length === 0) return null;
@@ -63,7 +70,8 @@ export function sanitizeElement(raw: unknown): El | null {
     case "ellipse":
     case "diamond":
     case "terminal":
-    case "data": {
+    case "data":
+    case "note": {
       if (!isNum(raw.x) || !isNum(raw.y) || !isNum(raw.w) || !isNum(raw.h)) return null;
       const el: BoxEl = {
         id,
@@ -79,6 +87,34 @@ export function sanitizeElement(raw: unknown): El | null {
       const label = labelOf(raw.label);
       if (label) el.label = label;
       return el;
+    }
+    case "image": {
+      if (!isNum(raw.x) || !isNum(raw.y) || !isNum(raw.w) || !isNum(raw.h) || !isAssetId(raw.src)) return null;
+      return { id, type: "image", color, width, x: raw.x, y: raw.y, w: Math.abs(raw.w), h: Math.abs(raw.h), src: raw.src };
+    }
+    case "comment": {
+      if (!isNum(raw.x) || !isNum(raw.y) || typeof raw.text !== "string" || !raw.text.trim()) return null;
+      const c: CommentEl = {
+        id,
+        type: "comment",
+        color,
+        width: 1,
+        x: raw.x,
+        y: raw.y,
+        text: raw.text.slice(0, 5000),
+        author: typeof raw.author === "string" && raw.author.trim() ? raw.author.trim().slice(0, 40) : "Ospite",
+        t: isNum(raw.t) ? raw.t : 0,
+      };
+      const re = ref(raw.re);
+      const target = ref(raw.target);
+      if (re) c.re = re;
+      if (target && isNum(raw.ox) && isNum(raw.oy)) {
+        c.target = target;
+        c.ox = raw.ox;
+        c.oy = raw.oy;
+      }
+      if (raw.done === true) c.done = true;
+      return c;
     }
     case "text": {
       if (!isNum(raw.x) || !isNum(raw.y) || typeof raw.text !== "string") return null;
@@ -132,7 +168,17 @@ export function parseBoard(text: string): PersistedBoard | null {
       : undefined,
     pages: parsePages(data.pages) ?? undefined,
     collab: parseSaved(data.collab),
+    assets: parseAssets(data.assets),
   };
+}
+
+function parseAssets(v: unknown): Record<string, string> | undefined {
+  if (!isObj(v)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, d] of Object.entries(v)) {
+    if (isAssetId(k) && typeof d === "string" && d.startsWith("data:image/") && d.length < 20_000_000) out[k] = d;
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 export function downloadBlob(blob: Blob, filename: string): void {

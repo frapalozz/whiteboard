@@ -24,7 +24,10 @@ export const SHARE_HARD_LIMIT = 1_500_000;
 const MAX_INFLATED = 40 * 1024 * 1024;
 
 /** L'ordine conta (il link salva l'indice): aggiungere solo in fondo. */
-const TYPES = ["stroke", "line", "arrow", "rect", "ellipse", "text", "diamond", "terminal", "data"] as const;
+const TYPES = ["stroke", "line", "arrow", "rect", "ellipse", "text", "diamond", "terminal", "data", "note"] as const;
+type LinkEl = Extract<El, { type: (typeof TYPES)[number] }>;
+/** Immagini (il file non sta nel link) e commenti non viaggiano nei link. */
+const inLink = (el: El): el is LinkEl => (TYPES as readonly string[]).includes(el.type);
 
 const q = (v: number) => Math.round(v * 100);
 const uq = (v: number) => v / 100;
@@ -38,7 +41,7 @@ type Packed = Array<number | string>;
  * `index`: posizione di ogni elemento nel link, per gli agganci delle frecce (gli id non viaggiano:
  * vengono rigenerati dalla posizione). Campi facoltativi in coda, così i link vecchi restano validi.
  */
-function packElement(el: El, index: Map<string, number>): Packed {
+function packElement(el: LinkEl, index: Map<string, number>): Packed {
   const head: Packed = [TYPES.indexOf(el.type), hex(el.color), Math.round(el.width * 100) / 100];
   switch (el.type) {
     case "stroke": {
@@ -67,7 +70,8 @@ function packElement(el: El, index: Map<string, number>): Packed {
     case "ellipse":
     case "diamond":
     case "terminal":
-    case "data": {
+    case "data":
+    case "note": {
       const out: Packed = [...head, q(el.x), q(el.y), q(el.w), q(el.h), el.fill ? 1 : 0];
       if (el.label) out.push(el.label);
       return out;
@@ -106,6 +110,7 @@ function unpackElement(p: unknown, index: number): unknown {
     case "diamond":
     case "terminal":
     case "data":
+    case "note":
       return { ...base, x: n(3), y: n(4), w: n(5), h: n(6), fill: p[7] === 1, label: p[8] };
     case "text":
       return { ...base, x: n(3), y: n(4), fontSize: Number(p[5]), text: String(p[6] ?? "") };
@@ -168,7 +173,9 @@ export async function inflate(data: Uint8Array): Promise<Uint8Array> {
 
 /** Codifica una lavagna nel valore del fragment (senza il prefisso `lavagna=`). */
 export async function encodeBoard(board: PersistedBoard): Promise<string> {
-  const index = new Map(board.elements.map((el, i) => [el.id, i]));
+  const els = board.elements.filter(inLink);
+  const index = new Map(els.map((el, i) => [el.id, i]));
+  const locked = els.flatMap((el, i) => (el.locked ? [i] : []));
   const doc = {
     v: 1,
     n: board.name ?? "",
@@ -176,7 +183,8 @@ export async function encodeBoard(board: PersistedBoard): Promise<string> {
     g: board.grid ? GRIDS.indexOf(board.grid) : undefined,
     p: board.pages || undefined,
     c: board.camera ? [q(board.camera.x), q(board.camera.y), Math.round(board.camera.zoom * 1000) / 1000] : undefined,
-    e: board.elements.map((el) => packElement(el, index)),
+    e: els.map((el) => packElement(el, index)),
+    l: locked.length ? locked : undefined,
   };
   const raw = new TextEncoder().encode(JSON.stringify(doc));
   if (hasStreams()) {
@@ -216,7 +224,12 @@ export async function decodeBoard(value: string): Promise<PersistedBoard | null>
         grid: typeof d.g === "number" ? GRIDS[d.g] : undefined,
         pages: d.p,
         camera: cam ? { x: uq(cam[0]), y: uq(cam[1]), zoom: cam[2] } : undefined,
-        elements: d.e.map(unpackElement).filter((e) => e !== null),
+        elements: d.e
+          .map((p, i) => {
+            const el = unpackElement(p, i);
+            return el && Array.isArray(d.l) && d.l.includes(i) ? { ...(el as object), locked: true } : el;
+          })
+          .filter((e) => e !== null),
       }),
     );
   } catch {

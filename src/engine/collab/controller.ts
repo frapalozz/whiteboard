@@ -3,6 +3,8 @@ import { accessOf, aclText, MAX_OVERRIDES, type Access, type Acl, type SignedAcl
 import { authSupported, loadIdentity, newIdentity, sign, siteFor, verify, type Identity, type IdentitySaved } from "./auth";
 import { CollabDoc, MAX_POINTS, type Props } from "./doc";
 import { moveKey, type MovePreview } from "../preview";
+import { assetArrived, getAsset, putVerifiedAsset } from "../assets";
+import { ASSET_PART } from "./protocol";
 import { cleanName, colorFor, randomId } from "./protocol";
 import { CollabSession, webrtcSupported } from "./session";
 import { relaySupported } from "./relay";
@@ -15,7 +17,7 @@ export interface CollabHost {
   getProps(): Props;
   getBoardName(): string;
   /** `view`: area visibile in coordinate mondo (la segue chi ti segue). */
-  getPresence(): { cursor: Point | null; draft: El | null; view: Rect | null; moving: MovePreview | null };
+  getPresence(): { cursor: Point | null; draft: El | null; view: Rect | null; moving: MovePreview | null; laser: number[] | null };
   /** true durante un trascinamento/ridimensionamento locale: gli aggiornamenti remoti si rimandano. */
   isBusy(): boolean;
   /** Applica lo stato remoto al documento locale (senza history e senza rimandarlo in rete). */
@@ -37,6 +39,8 @@ export interface RemoteView {
   draft: El | null;
   /** Elementi che sta trascinando in questo momento. */
   moving: MovePreview | null;
+  /** Scia del puntatore laser (coordinate mondo, istante di arrivo). */
+  laser: Array<{ x: number; y: number; t: number }>;
   /** Ultima area visibile annunciata (coordinate mondo). */
   view: Rect | null;
   /** Chiede di essere seguito. */
@@ -371,7 +375,7 @@ export class Collab {
       },
       {
         onPeerOpen: (peer) => {
-          this.remotes.set(peer.site, { site: peer.site, name: peer.name, color: peer.color, cursor: null, draft: null, moving: null, view: null, leading: false });
+          this.remotes.set(peer.site, { site: peer.site, name: peer.name, color: peer.color, cursor: null, draft: null, moving: null, laser: [], view: null, leading: false });
           // ognuno manda il proprio stato completo: il merge è idempotente
           for (const b of doc.snapshot()) this.session?.sendTo(peer.site, { t: "ops", b });
           // chi arriva a lezione iniziata sa subito chi seguire e cosa sta guardando
@@ -381,6 +385,8 @@ export class Collab {
           // i permessi più recenti che conosciamo, e la nostra richiesta se arriva il proprietario
           if (this.sec) this.session?.sendTo(peer.site, { t: "acl", a: this.sec.acl });
           if (this.asked && peer.site === this.sec?.hs) this.session?.sendTo(peer.site, { t: "ask", on: true });
+          // immagini che ci mancano: magari le ha chi è appena arrivato
+          for (const id of this.wanted) this.session?.sendTo(peer.site, { t: "ag", id });
           this.refreshUI();
         },
         onPeerClose: (site) => {
@@ -502,6 +508,20 @@ export class Collab {
         rv.draft = msg.el;
         this.host.invalidate();
         return;
+      case "ag":
+        void this.serveAsset(msg.id, from);
+        return;
+      case "ad":
+        void this.receiveAsset(msg, from);
+        return;
+      case "lz": {
+        if (!rv) return;
+        const now = performance.now();
+        for (let i = 0; i + 1 < msg.p.length; i += 2) rv.laser.push({ x: msg.p[i], y: msg.p[i + 1], t: now });
+        if (rv.laser.length > 600) rv.laser.splice(0, rv.laser.length - 600);
+        this.host.invalidate();
+        return;
+      }
       case "mv":
         if (!rv) return;
         if (msg.ids.length === 0) rv.moving = null;
@@ -538,6 +558,74 @@ export class Collab {
         this.refreshUI();
         return;
     }
+  }
+
+  /* ---------------------------------------------------------------------
+   * File delle immagini: si chiedono a chi li ha e arrivano a pezzi, una volta sola
+   * ------------------------------------------------------------------- */
+
+  /** Immagini usate nella lavagna ma non presenti in questo browser. */
+  private wanted = new Set<string>();
+  private incoming = new Map<string, { from: string; m: string; n: number; parts: Array<string | undefined>; got: number; t: number }>();
+  private serving = new Set<string>();
+
+  wantAsset(id: string): void {
+    if (this.wanted.has(id)) return;
+    this.wanted.add(id);
+    this.session?.send({ t: "ag", id });
+  }
+
+  private async serveAsset(id: string, to: string): Promise<void> {
+    const key = `${to}|${id}`;
+    if (this.serving.has(key)) return;
+    const a = await getAsset(id);
+    if (!a || !this.session) return;
+    this.serving.add(key);
+    try {
+      const n = Math.max(1, Math.ceil(a.bytes.length / ASSET_PART));
+      for (let i = 0; i < n; i++) {
+        // un pezzo alla volta: modifiche e cursori continuano a passare
+        while (this.session && this.session.queued(to) > 30) await new Promise((r) => setTimeout(r, 40));
+        const s = this.session;
+        if (!s || !s.peerList.some((p) => p.site === to)) return;
+        const part = a.bytes.subarray(i * ASSET_PART, (i + 1) * ASSET_PART);
+        let bin = "";
+        for (let k = 0; k < part.length; k += 0x8000) bin += String.fromCharCode(...part.subarray(k, k + 0x8000));
+        s.sendTo(to, { t: "ad", id, m: a.mime, i, n, d: btoa(bin) });
+      }
+    } finally {
+      this.serving.delete(key);
+    }
+  }
+
+  private async receiveAsset(msg: Extract<Msg, { t: "ad" }>, from: string): Promise<void> {
+    if (!this.wanted.has(msg.id)) return;
+    let inc = this.incoming.get(msg.id);
+    // si accetta un file da un solo mittente alla volta (gli altri doppioni si ignorano)
+    if (inc && inc.from !== from && Date.now() - inc.t < 20_000) return;
+    if (!inc || inc.from !== from || inc.n !== msg.n) {
+      inc = { from, m: msg.m, n: msg.n, parts: new Array(msg.n), got: 0, t: Date.now() };
+      this.incoming.set(msg.id, inc);
+    }
+    if (inc.parts[msg.i] === undefined) {
+      inc.parts[msg.i] = msg.d;
+      inc.got++;
+    }
+    inc.t = Date.now();
+    if (inc.got < inc.n) return;
+    this.incoming.delete(msg.id);
+    let bin = "";
+    try {
+      for (const p of inc.parts) bin += atob(p ?? "");
+    } catch {
+      return;
+    }
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    // vale solo se il contenuto corrisponde all'id (hash): nessuno può spacciare un'immagine per un'altra
+    if (!(await putVerifiedAsset(msg.id, bytes, inc.m))) return;
+    this.wanted.delete(msg.id);
+    assetArrived(msg.id);
+    this.host.invalidate();
   }
 
   /* ---------------------------------------------------------------------
@@ -705,7 +793,8 @@ export class Collab {
   private flushPresence(): void {
     const s = this.session;
     if (!s) return;
-    const { cursor, draft, view, moving } = this.host.getPresence();
+    const { cursor, draft, view, moving, laser } = this.host.getPresence();
+    if (laser) s.send({ t: "lz", p: laser });
 
     // trascinamento: la fine parte dopo le modifiche vere (mandate subito al rilascio), così chi guarda non
     // vede l'elemento tornare indietro per un attimo
